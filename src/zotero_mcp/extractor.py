@@ -5,9 +5,10 @@ Given a paper's markdown (produced by MinerU/markitdown), call an LLM with a
 rigid JSON schema and return a validated `ExtractedPaper` pydantic object. This
 is the bridge between raw text and the Neo4j/Qdrant ingest layer (M3).
 
-Default provider: **Kimi coding subscription** (Anthropic-compatible endpoint
-at `api.kimi.com/coding/v1/messages`). Override via env for other providers
-(Moonshot platform, DashScope/Qwen, DeepSeek, OpenAI). Canonical reference:
+Default provider chain: **Kimi coding subscription** (primary, Anthropic-compat
+at `api.kimi.com/coding/v1/messages`) → **Z.AI coding plan GLM-5** (fallback,
+OpenAI-compat at `api.z.ai/api/coding/paas/v4/chat/completions`). Override via
+env for other providers. Canonical reference:
 `~/workspace/claude-workspace/.claude/skills/daily-ops-morning-briefing/scripts/helper_llm.py`.
 
 Env vars:
@@ -59,13 +60,13 @@ PROVIDER_CHAIN = [
         "protocol":  "anthropic",  # x-api-key header, Anthropic message schema
     },
     {
-        "name":      "qwen",
-        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        # qwen-plus: best-quality non-max Qwen; ~7 methods / 7 concepts per paper (Kimi-parity),
-        # vs qwen-turbo's 3.3 methods. Speed 68s vs turbo's 16s is fine since this is fallback
-        # (Kimi 35s remains primary when quota available).
-        "model":     os.getenv("QWEN_MODEL", "qwen-plus"),
-        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "name":      "zai",
+        # Z.AI coding-plan endpoint (separate quota from paas/v4). OpenAI-compat
+        # schema, Bearer auth. glm-5 (alias of glm-5.1) matches Kimi extraction
+        # quality in spot tests and the coding plan has generous daily quota.
+        "url":       os.getenv("ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"),
+        "model":     os.getenv("ZAI_MODEL", "glm-5"),
+        "key_envs":  ("Z_AI_API_KEY", "ZAI_API_KEY"),
         "protocol":  "openai",
     },
 ]
