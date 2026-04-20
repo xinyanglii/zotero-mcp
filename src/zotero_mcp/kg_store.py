@@ -163,15 +163,22 @@ class QdrantWriter:
         port: int,
         collection: str,
         dashscope_api_key: str,
-        embed_model: str = "text-embedding-v4",
-        embed_dim: int = 2048,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
+        embed_base_url: str | None = None,
     ):
         from qdrant_client import QdrantClient
         self.qc = QdrantClient(host=host, port=port, timeout=60)
         self.collection = collection
         self.dashscope_key = dashscope_api_key
-        self.embed_model = embed_model
-        self.embed_dim = embed_dim
+        # env-driven defaults so the client stays portable (new provider /
+        # self-hosted endpoint / different embedding model only changes env).
+        self.embed_model = embed_model or os.getenv(
+            "EMBED_MODEL", "text-embedding-v4")
+        self.embed_dim = embed_dim or int(os.getenv("EMBED_DIM", "2048"))
+        self.embed_base_url = (embed_base_url
+            or os.getenv("DASHSCOPE_BASE_URL")
+            or "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
         # lazy BM25
         self._bm25 = None
 
@@ -194,7 +201,7 @@ class QdrantWriter:
                 "dimensions": self.embed_dim,
             }).encode()
             req = urllib.request.Request(
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings",
+                f"{self.embed_base_url}/embeddings",
                 data=payload,
                 headers={
                     "Authorization": f"Bearer {self.dashscope_key}",

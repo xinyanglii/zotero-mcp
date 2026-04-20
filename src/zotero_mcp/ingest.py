@@ -116,30 +116,20 @@ def resolve_pdf_bytes(item: dict) -> bytes | None:
     return None
 
 
-def _webdav_auth_header() -> str:
-    creds = f"{os.environ['ZOTERO_WEBDAV_USER']}:{os.environ['ZOTERO_WEBDAV_PASS']}"
-    return "Basic " + base64.b64encode(creds.encode()).decode()
-
-
 def _webdav_fetch(attachment_key: str) -> bytes | None:
-    """Download <key>.zip from /dav/zotero/ and return the inner PDF."""
-    url = f"https://dav.jianguoyun.com/dav/zotero/{attachment_key}.zip"
-    req = urllib.request.Request(url, headers={"Authorization": _webdav_auth_header()})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            zbytes = r.read()
-    except Exception as e:
-        logger.debug("WebDAV miss %s: %s", attachment_key, e)
+    """Download <key>.zip from the configured WebDAV root and return the inner PDF.
+
+    Delegates to ``zotero_mcp.webdav`` so WebDAV host + creds come from env
+    (ZOTERO_WEBDAV_URL / ZOTERO_WEBDAV_USER / ZOTERO_WEBDAV_PASS), not hardcoded.
+    """
+    from zotero_mcp import webdav as _webdav
+    if not _webdav.webdav_enabled():
         return None
-    try:
-        with zipfile.ZipFile(io.BytesIO(zbytes)) as zf:
-            for name in zf.namelist():
-                if name.lower().endswith(".pdf"):
-                    return zf.read(name)
-    except Exception as e:
-        logger.warning("zip parse err %s: %s", attachment_key, e)
-        return None
-    return None
+    raw = _webdav.fetch_attachment_bytes(attachment_key)
+    # ingest pipeline specifically wants the PDF bytes; WebDAV helper returns
+    # the first file in the zip (Zotero's single-file convention), which is
+    # the PDF here.
+    return raw
 
 
 def _zotero_cloud_fetch(attachment_key: str) -> bytes | None:
@@ -291,9 +281,15 @@ def main():
     ap.add_argument("--sqlite", default=os.path.expanduser("~/.cache/zotero-mcp/kg.sqlite"))
     ap.add_argument("--neo4j-uri", default=os.environ.get("NEO4J_ZOTERO_URI"))
     ap.add_argument("--neo4j-user", default=os.environ.get("NEO4J_ZOTERO_USER", "neo4j"))
-    ap.add_argument("--qdrant-host", default="100.68.195.10")
-    ap.add_argument("--qdrant-port", type=int, default=6333)
-    ap.add_argument("--qdrant-collection", default="zotero_library")
+    ap.add_argument("--qdrant-host",
+                    default=os.environ.get("QDRANT_HOST", "127.0.0.1"),
+                    help="Qdrant host (env: QDRANT_HOST)")
+    ap.add_argument("--qdrant-port", type=int,
+                    default=int(os.environ.get("QDRANT_PORT", "6333")),
+                    help="Qdrant port (env: QDRANT_PORT)")
+    ap.add_argument("--qdrant-collection",
+                    default=os.environ.get("QDRANT_COLLECTION", "zotero_library"),
+                    help="Qdrant collection name (env: QDRANT_COLLECTION)")
     ap.add_argument("--keys", nargs="+", default=None, help="specific Zotero keys")
     ap.add_argument("--workers", type=int,
                     default=int(os.environ.get("INGEST_WORKERS", "3")),
