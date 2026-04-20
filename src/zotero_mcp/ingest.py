@@ -284,7 +284,10 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
 
 
 def main():
-    logging.basicConfig(level=logging.INFO,
+    # force=True: qdrant-client / pyzotero import earlier call basicConfig at
+    # WARNING, making our INFO line (extractor active providers, fell back to
+    # zai OK) disappear. force=True lets us take over.
+    logging.basicConfig(level=logging.INFO, force=True,
                         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None)
