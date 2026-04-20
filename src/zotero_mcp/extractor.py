@@ -288,6 +288,10 @@ def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) 
     silently mask schema bugs).
     """
     providers = _active_providers()
+    if not getattr(_call_llm, "_logged_chain", False):
+        logger.info("extractor active providers: %s",
+                    [p["name"] for p in providers])
+        _call_llm._logged_chain = True  # type: ignore[attr-defined]
     last_exc: Exception | None = None
     for i, p in enumerate(providers):
         try:
@@ -301,6 +305,16 @@ def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) 
                 body = e.read().decode("utf-8", errors="replace")[:500]
             except Exception:
                 pass
+            finally:
+                # Close the HTTPError's underlying socket. urllib raises
+                # HTTPError during urlopen() (before `with ... as r:` binds)
+                # so `with` never runs — the socket stays in CLOSE_WAIT
+                # until GC unless we close explicitly. Hundreds of 429s
+                # add up to 359-socket leaks against CF-fronted endpoints.
+                try:
+                    e.close()
+                except Exception:
+                    pass
             fallback = _is_fallback_worthy(e.code, body)
             logger.warning(
                 "extractor: %s HTTP %d%s  body=%s",

@@ -167,8 +167,14 @@ class QdrantWriter:
         embed_dim: int | None = None,
         embed_base_url: str | None = None,
     ):
+        # qdrant-client's internal `requests`/`httpx` pool had repeated mid-
+        # stream `IncompleteRead`/`Connection refused` against the VPS 1.17.1
+        # instance (raw HTTP PUT w/ same payload worked fine — so it's the
+        # lib). Use raw urllib directly for upsert to sidestep it. Client kept
+        # around only for non-hot paths.
         from qdrant_client import QdrantClient
         self.qc = QdrantClient(host=host, port=port, timeout=60)
+        self._qdrant_base = f"http://{host}:{port}"
         self.collection = collection
         self.dashscope_key = dashscope_api_key
         # env-driven defaults so the client stays portable (new provider /
@@ -229,8 +235,6 @@ class QdrantWriter:
         markdown: str,
     ) -> int:
         """Chunk markdown, embed (dense + sparse), upsert to Qdrant. Returns chunk count."""
-        from qdrant_client.http.models import PointStruct, SparseVector
-
         chunks = section_chunks(markdown)
         if not chunks:
             return 0
@@ -244,14 +248,14 @@ class QdrantWriter:
                 uuid.NAMESPACE_URL,
                 f"{paper.paper_id}#{c['chunk_idx']}",
             ))
-            points.append(PointStruct(
+            points.append(dict(
                 id=pid,
                 vector={
-                    "dense": d_vec,
-                    "bm25": SparseVector(
-                        indices=s_vec.indices.tolist(),
-                        values=s_vec.values.tolist(),
-                    ),
+                    "dense": list(d_vec),
+                    "bm25": {
+                        "indices": s_vec.indices.tolist(),
+                        "values":  s_vec.values.tolist(),
+                    },
                 },
                 payload={
                     "paper_id": paper.paper_id,
@@ -263,7 +267,41 @@ class QdrantWriter:
                     "text": c["text"],
                 },
             ))
-        self.qc.upsert(collection_name=self.collection, points=points)
+        # Raw HTTP upsert in batches of 50 with wait=false. qdrant-client 1.12
+        # against Qdrant server 1.17.1 was truncating responses mid-stream
+        # (IncompleteRead), raw HTTP from the same process works fine — so
+        # we bypass the lib for the hot write path. Exp backoff on transient
+        # errors; raise on final failure so ingest can record it for later
+        # --retry-failed.
+        import urllib.request, urllib.error
+        url = f"{self._qdrant_base}/collections/{self.collection}/points?wait=false"
+
+        def _put(batch):
+            body = json.dumps({"points": batch}).encode()
+            last_exc: Exception | None = None
+            for attempt, delay in enumerate([0, 2, 8, 30], start=1):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    req = urllib.request.Request(url, data=body, method="PUT",
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=60) as r:
+                        data = json.loads(r.read())
+                    if data.get("status") != "ok":
+                        raise RuntimeError(f"qdrant reported status={data.get('status')}")
+                    if attempt > 1:
+                        logger.info("qdrant upsert %s batch(%d) succeeded on attempt %d",
+                                    paper.paper_id, len(batch), attempt)
+                    return
+                except Exception as e:
+                    last_exc = e
+                    logger.warning("qdrant upsert %s batch(%d) attempt %d failed: %s",
+                                   paper.paper_id, len(batch), attempt, e)
+            assert last_exc is not None
+            raise last_exc
+
+        for i in range(0, len(points), 50):
+            _put(points[i:i+50])
         return len(points)
 
 

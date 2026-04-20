@@ -33,6 +33,16 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# Load ~/.claude/.env.local so `nohup python -m zotero_mcp.ingest ...` works
+# from any shell (no need to pre-`source` the env). Without this, a cold-shell
+# launch crashes on KeyError('NEO4J_ZOTERO_PASSWORD') (or silently empty
+# KIMI_API_KEY / Z_AI_API_KEY, which is worse).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.expanduser("~/.claude/.env.local"), override=False)
+except ImportError:
+    pass
+
 from .extractor import extract_structured
 from .kg_store import make_writers
 from .parser_factory import convert_to_markdown_smart
