@@ -39,14 +39,48 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
-HELPER_URL = os.getenv("HELPER_LLM_URL", "https://api.kimi.com/coding/v1/messages")
-HELPER_MODEL = os.getenv("HELPER_LLM_MODEL", "kimi-for-coding")
-HELPER_PROVIDER = os.getenv("HELPER_LLM_PROVIDER", "anthropic").lower()
 MAX_INPUT_TOKENS = int(os.getenv("EXTRACTOR_MAX_INPUT_TOKENS", "180000"))
 SCHEMA_ERR_LOG = Path(os.getenv(
     "ZOTERO_SCHEMA_ERR_LOG",
     str(Path.home() / ".cache" / "zotero-mcp" / "schema_errors.jsonl"),
 ))
+
+# Provider chain: tried in order per call. On recoverable errors (HTTP 429,
+# 402 quota, 5xx) we move to the next provider. This lets Kimi burn subscription
+# quota as primary, and DashScope/Qwen take over when Kimi's rolling window is
+# saturated. The chain is defined in code (not env) so the fallback is always on
+# by default; override via EXTRACTOR_DISABLE_FALLBACK=1 if you want single-provider.
+PROVIDER_CHAIN = [
+    {
+        "name":      "kimi",
+        "url":       os.getenv("KIMI_URL", "https://api.kimi.com/coding/v1/messages"),
+        "model":     os.getenv("KIMI_MODEL", "kimi-for-coding"),
+        "key_envs":  ("KIMI_API_KEY", "MOONSHOT_API_KEY"),
+        "protocol":  "anthropic",  # x-api-key header, Anthropic message schema
+    },
+    {
+        "name":      "qwen",
+        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+]
+
+
+def _active_providers() -> list[dict]:
+    if os.environ.get("EXTRACTOR_DISABLE_FALLBACK"):
+        return PROVIDER_CHAIN[:1]
+    if "HELPER_LLM_URL" in os.environ:
+        # legacy single-provider override — respect it, no fallback
+        return [{
+            "name": "env-override",
+            "url":  os.environ["HELPER_LLM_URL"],
+            "model": os.environ.get("HELPER_LLM_MODEL", "kimi-for-coding"),
+            "key_envs": ("HELPER_LLM_API_KEY", "KIMI_API_KEY"),
+            "protocol": os.environ.get("HELPER_LLM_PROVIDER", "anthropic").lower(),
+        }]
+    return PROVIDER_CHAIN
 
 
 # ---------- schema ----------
@@ -168,14 +202,12 @@ JSON schema:
 }"""
 
 
-def _api_key() -> str:
-    k = (os.getenv("HELPER_LLM_API_KEY")
-         or os.getenv("KIMI_API_KEY")
-         or os.getenv("MOONSHOT_API_KEY")
-         or "")
-    if not k:
-        raise RuntimeError("HELPER_LLM_API_KEY / KIMI_API_KEY not set")
-    return k
+def _lookup_key(envs: tuple[str, ...]) -> str | None:
+    for e in envs:
+        v = os.environ.get(e)
+        if v:
+            return v
+    return None
 
 
 def _truncate(md: str, budget_tokens: int) -> str:
@@ -187,25 +219,44 @@ def _truncate(md: str, budget_tokens: int) -> str:
     return head + f"\n\n[...truncated {len(md) - max_chars} chars...]"
 
 
-def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) -> str:
-    """Send a single prompt and return text response. Raises on HTTP error."""
-    messages = [
-        {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + user_prompt},
-    ]
-    if HELPER_PROVIDER == "anthropic":
+def _is_fallback_worthy(http_code: int, body: str) -> bool:
+    """Return True if this provider's failure is the kind we should try the
+    next provider for (quota / capacity / server down), vs a schema/request
+    bug where another provider would hit the same wall."""
+    if http_code in (401, 403, 429, 402, 500, 502, 503, 504, 529):
+        return True
+    b = (body or "").lower()
+    for marker in ("quota", "rate limit", "too many", "overloaded",
+                   "capacity", "insufficient_balance", "billing"):
+        if marker in b:
+            return True
+    return False
+
+
+def _call_one(provider: dict, user_prompt: str,
+              *, max_tokens: int, timeout: int) -> str:
+    """Single-provider attempt. Raises urllib.error.HTTPError on HTTP failure
+    (body embedded) or ConnectionError on transport failure."""
+    api_key = _lookup_key(provider["key_envs"])
+    if not api_key:
+        raise RuntimeError(f"no API key for provider {provider['name']}: "
+                           f"tried {provider['key_envs']}")
+    messages = [{"role": "user", "content": SYSTEM_PROMPT + "\n\n" + user_prompt}]
+
+    if provider["protocol"] == "anthropic":
         payload = json.dumps({
-            "model": HELPER_MODEL,
+            "model": provider["model"],
             "max_tokens": max_tokens,
             "messages": messages,
         }).encode()
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": _api_key(),
+            "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
     else:  # openai-compatible
         payload = json.dumps({
-            "model": HELPER_MODEL,
+            "model": provider["model"],
             "max_tokens": max_tokens,
             "messages": messages,
             "response_format": {"type": "json_object"},
@@ -213,14 +264,58 @@ def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) 
         }).encode()
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {_api_key()}",
+            "Authorization": f"Bearer {api_key}",
         }
-    req = urllib.request.Request(HELPER_URL, data=payload, headers=headers)
+
+    req = urllib.request.Request(provider["url"], data=payload, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
-    if HELPER_PROVIDER == "anthropic":
+
+    if provider["protocol"] == "anthropic":
         return data["content"][0]["text"].strip()
     return data["choices"][0]["message"]["content"].strip()
+
+
+def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) -> str:
+    """Provider-chain aware call. Yields the first successful response text.
+
+    Raises the last seen HTTPError if every provider fails on a fallback-worthy
+    condition, or propagates immediately on a non-fallback error (so we don't
+    silently mask schema bugs).
+    """
+    providers = _active_providers()
+    last_exc: Exception | None = None
+    for i, p in enumerate(providers):
+        try:
+            out = _call_one(p, user_prompt, max_tokens=max_tokens, timeout=timeout)
+            if i > 0:
+                logger.info("extractor: fell back to %s OK", p["name"])
+            return out
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            fallback = _is_fallback_worthy(e.code, body)
+            logger.warning(
+                "extractor: %s HTTP %d%s  body=%s",
+                p["name"], e.code,
+                " (fallback-worthy)" if fallback else "",
+                body[:200],
+            )
+            last_exc = e
+            if not fallback:
+                raise
+        except RuntimeError as e:
+            # missing key etc — skip provider
+            logger.warning("extractor: skip %s: %s", p["name"], e)
+            last_exc = e
+        except Exception as e:
+            logger.warning("extractor: %s transport err: %s", p["name"], e)
+            last_exc = e
+    assert last_exc is not None
+    raise last_exc
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
