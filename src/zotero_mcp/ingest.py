@@ -259,6 +259,24 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
 
     sql.save_paper(paper, item_type=item["itemType"],
                    md_text=md, mineru_secs=mineru_secs, llm_secs=llm_secs)
+
+    # Attach the extracted markdown as a Zotero child attachment so downstream
+    # agents can read the parsed text directly, without re-running MinerU.
+    # Gated by ZOTERO_MCP_ATTACH_MD=1 to preserve backwards compatibility.
+    if os.environ.get("ZOTERO_MCP_ATTACH_MD", "1") == "1" and not metadata_only:
+        try:
+            from scripts.backfill_md_attachments import (
+                upload_md_as_attachment, add_parent_tag, parent_has_tag, TAG_DONE,
+            )
+            if not parent_has_tag(pid, TAG_DONE):
+                att_key = upload_md_as_attachment(pid, md)
+                if att_key:
+                    add_parent_tag(pid, TAG_DONE)
+                    stats["md_att"] = att_key
+        except Exception as e:
+            sql.record_failure(pid, "md_attach", repr(e)[:300])
+            logger.warning("md attach failed for %s: %s", pid, e)
+
     stats.update({"mineru_s": round(mineru_secs, 1), "llm_s": round(llm_secs, 1),
                   "total_s": round(time.time() - t_start, 1),
                   "refs": len(paper.references)})
