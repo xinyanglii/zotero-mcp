@@ -61,7 +61,10 @@ PROVIDER_CHAIN = [
     {
         "name":      "qwen",
         "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
+        # qwen-plus: best-quality non-max Qwen; ~7 methods / 7 concepts per paper (Kimi-parity),
+        # vs qwen-turbo's 3.3 methods. Speed 68s vs turbo's 16s is fine since this is fallback
+        # (Kimi 35s remains primary when quota available).
+        "model":     os.getenv("QWEN_MODEL", "qwen-plus"),
         "key_envs":  ("DASHSCOPE_API_KEY",),
         "protocol":  "openai",
     },
