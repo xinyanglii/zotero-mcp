@@ -24,6 +24,7 @@ except Exception:
 from pyzotero import zotero
 
 from .chroma_client import ChromaClient, create_chroma_client
+from .backend_factory import create_backend_client
 from .client import get_zotero_client
 from .utils import format_creators, is_local_mode
 from .local_db import LocalZoteroReader, get_local_zotero_reader
@@ -86,7 +87,9 @@ class ZoteroSemanticSearch:
             config_path: Path to configuration file
             db_path: Optional path to Zotero database (overrides config file)
         """
-        self.chroma_client = chroma_client or create_chroma_client(config_path)
+        # Backend factory dispatches to ChromaDB (default) or Qdrant based on
+        # config.json ``backend.type`` or ZOTERO_MCP_BACKEND env var.
+        self.chroma_client = chroma_client or create_backend_client(config_path)
         self.zotero_client = get_zotero_client()
         self.config_path = config_path
         self.db_path = db_path  # CLI override for Zotero database path
