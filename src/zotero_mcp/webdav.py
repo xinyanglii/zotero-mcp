@@ -34,7 +34,6 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +69,23 @@ def fetch_attachment_bytes(attachment_key: str, timeout: int = 60) -> bytes | No
     url = f"{_webdav_root()}/{attachment_key}.zip"
     req = urllib.request.Request(url, headers={"Authorization": _auth_header()})
     try:
-        raw = urllib.request.urlopen(req, timeout=timeout).read()
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
     except urllib.error.HTTPError as e:
         if e.code == 404:
+            logger.debug("WebDAV miss %s (404)", attachment_key)
             return None
         raise
     try:
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
-            names = zf.namelist()
-            if not names:
-                return None
-            # Single-file zip by Zotero convention; take the first entry
-            return zf.read(names[0])
+            # Skip directory entries; Zotero's sync zip contains a single
+            # file but a hostile or malformed zip could include traversal
+            # paths or dir entries that would raise IsADirectoryError here.
+            for name in zf.namelist():
+                if name.endswith("/"):
+                    continue
+                return zf.read(name)
+            return None
     except zipfile.BadZipFile:
         logger.warning("WebDAV %s returned non-zip content", attachment_key)
         return None
@@ -128,12 +132,30 @@ def upload_attachment_bytes(
     ).encode()
 
     headers = {"Authorization": _auth_header()}
-    for suffix, body in ((".zip", zip_bytes), (".prop", prop_xml)):
-        req = urllib.request.Request(
-            f"{root}/{attachment_key}{suffix}",
-            data=body, method="PUT", headers=headers,
-        )
-        urllib.request.urlopen(req, timeout=timeout).read()
+    uploaded: list[str] = []
+    try:
+        for suffix, body in ((".zip", zip_bytes), (".prop", prop_xml)):
+            req = urllib.request.Request(
+                f"{root}/{attachment_key}{suffix}",
+                data=body, method="PUT", headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                r.read()
+            uploaded.append(suffix)
+    except Exception:
+        # Partial upload cleanup: if .zip succeeded but .prop failed, delete
+        # the orphan .zip so Zotero desktop doesn't see a broken attachment.
+        for suffix in uploaded:
+            try:
+                req = urllib.request.Request(
+                    f"{root}/{attachment_key}{suffix}",
+                    method="DELETE", headers=headers,
+                )
+                urllib.request.urlopen(req, timeout=timeout).read()
+            except Exception as cleanup_err:
+                logger.debug("orphan cleanup of %s%s failed: %s",
+                             attachment_key, suffix, cleanup_err)
+        raise
     return md5_hex, mtime_ms
 
 
@@ -190,34 +212,30 @@ def create_zotero_webdav_attachment(
         logger.exception("WebDAV upload failed for %s: %s", att_key, e)
         return None
 
-    # patch md5 + mtime so Zotero desktop recognizes the upload
+    # patch md5 + mtime so Zotero desktop recognizes the upload.
+    # Use direct REST PATCH — pyzotero's ``update_item`` expects a specific
+    # dict shape that diverges across versions, and its internal error
+    # handling swallows 412s we want to surface. Direct urllib keeps the
+    # semantics explicit.
     try:
-        patch = {"md5": md5_hex, "mtime": mtime_ms}
-        headers = {}
+        api_base = zot.endpoint.rstrip("/")
+        # pyzotero stores library_type already plural ("users" / "groups"),
+        # NOT "user"/"group" — do NOT append another "s".
+        url = f"{api_base}/{zot.library_type}/{zot.library_id}/items/{att_key}"
+        body = json.dumps({"md5": md5_hex, "mtime": mtime_ms}).encode()
+        headers = {
+            "Zotero-API-Key": zot.api_key,
+            "Zotero-API-Version": "3",
+            "Content-Type": "application/json",
+        }
         if att_version is not None:
             headers["If-Unmodified-Since-Version"] = str(att_version)
-        # pyzotero doesn't expose a raw PATCH; fall back to requests-style via
-        # its internal `_session` when available, else reach into api_url.
-        try:
-            zot.update_item({**att, "data": {**att["data"], **patch}})
-        except Exception:
-            # fallback: raw REST PATCH
-            import urllib.request, json as _json
-            api_base = zot.endpoint
-            url = f"{api_base}/{zot.library_type}s/{zot.library_id}/items/{att_key}"
-            req = urllib.request.Request(
-                url,
-                data=_json.dumps(patch).encode(),
-                method="PATCH",
-                headers={
-                    "Zotero-API-Key": zot.api_key,
-                    "Zotero-API-Version": "3",
-                    "Content-Type": "application/json",
-                    **headers,
-                },
-            )
-            urllib.request.urlopen(req, timeout=30).read()
+        req = urllib.request.Request(url, data=body, method="PATCH", headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
     except Exception as e:
-        logger.debug("md5/mtime patch failed (non-fatal): %s", e)
+        # md5/mtime patch is load-bearing (Zotero desktop won't recognize
+        # the upload without it). Log at warning, not debug.
+        logger.warning("md5/mtime PATCH failed for %s: %s", att_key, e)
 
     return att_key

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import threading
 from typing import Any
 
 from mcp.server.fastmcp import Context
@@ -28,6 +30,17 @@ from zotero_mcp._app import mcp
 DEFAULT_EDGE_TYPES = ["CITES", "ABOUT", "USES", "PROPOSES", "IMPROVES",
                       "EVALUATES_ON", "SAME_WORK_AS"]
 
+# Whitelist of canonical edge type names we support — matches the KG schema
+# in kg_store.Neo4jWriter. Used to reject arbitrary strings from MCP callers
+# before inlining into Cypher (f-strings in Cypher + user-supplied type
+# names would be an injection vector otherwise).
+_ALLOWED_EDGES = {
+    "CITES", "ABOUT", "USES", "PROPOSES", "IMPROVES", "EVALUATES_ON",
+    "SAME_WORK_AS", "AUTHORED", "PUBLISHED_AT", "LIMITED_BY",
+    "PART_OF", "IN_COMMUNITY", "IMPLEMENTED_BY", "USES_DATASET",
+}
+_EDGE_NAME_RE = re.compile(r"^[A-Z][A-Z_]*$")
+
 
 def _neo4j_configured() -> bool:
     return bool(os.environ.get("NEO4J_ZOTERO_URI")
@@ -35,12 +48,27 @@ def _neo4j_configured() -> bool:
                 and os.environ.get("NEO4J_ZOTERO_PASSWORD"))
 
 
+# Module-level driver cache. FastMCP tools can be invoked concurrently; a
+# single driver instance holds its own connection pool so this is both safe
+# and avoids a connection-pool leak per call.
+_driver_singleton = None
+_driver_lock = threading.Lock()
+
+
 def _driver():
-    from neo4j import GraphDatabase
-    return GraphDatabase.driver(
-        os.environ["NEO4J_ZOTERO_URI"],
-        auth=(os.environ["NEO4J_ZOTERO_USER"], os.environ["NEO4J_ZOTERO_PASSWORD"]),
-    )
+    global _driver_singleton
+    if _driver_singleton is not None:
+        return _driver_singleton
+    with _driver_lock:
+        if _driver_singleton is not None:
+            return _driver_singleton
+        from neo4j import GraphDatabase
+        _driver_singleton = GraphDatabase.driver(
+            os.environ["NEO4J_ZOTERO_URI"],
+            auth=(os.environ["NEO4J_ZOTERO_USER"],
+                  os.environ["NEO4J_ZOTERO_PASSWORD"]),
+        )
+        return _driver_singleton
 
 
 @mcp.tool(
@@ -93,10 +121,26 @@ def zotero_related(
             "hint": "pip install neo4j",
         })
 
-    hops = max(1, min(3, int(hops)))
+    try:
+        hops = max(1, min(3, int(hops)))
+    except (TypeError, ValueError):
+        return json.dumps({"error": "bad_hops", "hint": "hops must be 1, 2, or 3"})
+
     types = edge_types or DEFAULT_EDGE_TYPES
-    # Cypher needs a pipe-joined type list for variable-length match
-    rel_pattern = "|".join(types)
+    # Validate each edge type: whitelist + regex to guard the Cypher f-string.
+    # Without this, an MCP client could inject arbitrary Cypher via edge_types.
+    safe_types = []
+    for t in types:
+        t = str(t).strip().upper()
+        if t in _ALLOWED_EDGES and _EDGE_NAME_RE.match(t):
+            safe_types.append(t)
+    if not safe_types:
+        return json.dumps({
+            "error": "no_valid_edge_types",
+            "hint": f"edge_types must be a subset of {sorted(_ALLOWED_EDGES)}",
+            "received": types,
+        })
+    rel_pattern = "|".join(safe_types)
     ctx.info(f"graph walk: {paper_id} hops={hops} types={rel_pattern} limit={limit}")
 
     # Note: ``size(r)`` (list length) not ``length(r)`` (which is Path-only).

@@ -105,8 +105,8 @@ def get_item_fulltext(
                 children = zot.children(item_key)
                 md_atts = [
                     c for c in children
-                    if c.get("data", {}).get("itemType") == "attachment"
-                    and c.get("data", {}).get("contentType") == "text/markdown"
+                    if (c.get("data") or {}).get("itemType") == "attachment"
+                    and (c.get("data") or {}).get("contentType") == "text/markdown"
                 ]
                 if md_atts:
                     att_key = md_atts[0].get("key") or md_atts[0]["data"].get("key")

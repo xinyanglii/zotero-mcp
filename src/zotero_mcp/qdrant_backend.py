@@ -338,20 +338,32 @@ class ZoteroQdrantClient:
         for qv in query_vectors:
             # qdrant-client ≥1.10 replaced ``.search()`` with ``.query_points()``
             # (old name removed in ≥1.13). Use the new API.
-            # The collection is built with NAMED vectors (``dense`` +
-            # optional ``bm25`` sparse) by the KG ingest pipeline — pass
-            # ``using="dense"`` so the query targets the right one. Naked
-            # ``query=qv`` fails on named-vector collections.
-            # TODO(M5-followup): add BM25 sparse prefetch + RRF fusion for
-            # true hybrid search. Skipped for now to avoid churn mid-ingest.
-            resp = self.client.query_points(
-                collection_name=self.collection_name,
-                query=qv,
-                using="dense",
-                query_filter=qfilter,
-                limit=n_results,
-                with_payload=True,
-            )
+            # Named-vector collections (KG ingest uses ``dense`` + optional
+            # ``bm25`` sparse) need ``using="dense"``; legacy collections
+            # created before the KG refactor have an unnamed default vector
+            # and reject ``using=``. Try named first, fall back on error so
+            # both topologies stay supported without user intervention.
+            # TODO(M5-followup): add BM25 sparse prefetch + RRF fusion.
+            try:
+                resp = self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=qv,
+                    using="dense",
+                    query_filter=qfilter,
+                    limit=n_results,
+                    with_payload=True,
+                )
+            except Exception as e:
+                if "Named vector" in str(e) or "not found" in str(e).lower():
+                    resp = self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=qv,
+                        query_filter=qfilter,
+                        limit=n_results,
+                        with_payload=True,
+                    )
+                else:
+                    raise
             hits = resp.points
             ids_out.append([h.payload.get("_doc_id", str(h.id)) for h in hits])
             docs_out.append([h.payload.get("_document", "") for h in hits])
