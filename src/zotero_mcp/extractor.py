@@ -35,7 +35,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +50,27 @@ SCHEMA_ERR_LOG = Path(os.getenv(
 
 
 # ---------- schema ----------
-Role = Literal[
+# Canonical role enum. LLM outputs are normalized into this set via a
+# validator rather than failing — real-world extraction produces synonyms
+# like "used" / "cited" / "benchmark" which we coerce to the nearest
+# canonical role instead of rejecting the whole paper.
+CANONICAL_ROLES = {
     "baseline", "prior-work", "related", "motivation",
     "contrast", "extends", "contradicts",
-]
+}
+ROLE_ALIASES = {
+    "used": "related", "use": "related", "uses": "related",
+    "applies": "related", "applied": "related",
+    "cited": "related", "citation": "related", "cite": "related",
+    "benchmark": "baseline", "comparison": "baseline", "compared": "baseline",
+    "reference": "related", "references": "related",
+    "background": "prior-work", "foundation": "prior-work",
+    "prior": "prior-work", "priorwork": "prior-work", "prior_work": "prior-work",
+    "improves": "extends", "extension": "extends",
+    "disagrees": "contradicts", "disagrees-with": "contradicts",
+    "contrasts": "contrast",
+    "motivates": "motivation",
+}
 ContributionType = Literal["theory", "method", "system", "survey", "dataset", "tool"]
 
 
@@ -65,15 +82,32 @@ class MethodImproved(BaseModel):
 class Reference(BaseModel):
     cited_title: str
     cited_author_year: str
-    role: Role
-    context_quote: str = Field(default="", max_length=240)
+    role: str
+    context_quote: str = ""
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _norm_role(cls, v):
+        if not isinstance(v, str):
+            return "related"
+        s = v.strip().lower().replace(" ", "-")
+        if s in CANONICAL_ROLES:
+            return s
+        return ROLE_ALIASES.get(s.replace("-", "_"), ROLE_ALIASES.get(s, "related"))
+
+    @field_validator("context_quote", mode="before")
+    @classmethod
+    def _trunc_quote(cls, v):
+        if not isinstance(v, str):
+            return ""
+        return v[:240]
 
 
 class ExtractedPaper(BaseModel):
     paper_id: str
     title: str
-    tldr: str = Field(max_length=280)
-    problem: str
+    tldr: str = ""
+    problem: str = ""
     methods_used: list[str] = Field(default_factory=list)
     methods_proposed: list[str] = Field(default_factory=list)
     methods_improved: list[MethodImproved] = Field(default_factory=list)
@@ -86,14 +120,31 @@ class ExtractedPaper(BaseModel):
     year: int | None = None
     contribution_type: ContributionType | None = None
 
+    @field_validator("tldr", "problem", mode="before")
+    @classmethod
+    def _trunc_str(cls, v):
+        if not isinstance(v, str):
+            return ""
+        return v[:500]
+
+    @field_validator("contribution_type", mode="before")
+    @classmethod
+    def _norm_ctype(cls, v):
+        if not isinstance(v, str):
+            return None
+        s = v.strip().lower()
+        return s if s in {"theory","method","system","survey","dataset","tool"} else None
+
 
 SYSTEM_PROMPT = """你是学术文献结构化抽取助手。读以下论文 Markdown，严格按 JSON schema 输出。
 
 规则：
-- references 每条必须标 role，role ∈ {baseline, prior-work, related, motivation, contrast, extends, contradicts}
+- references 每条必须标 role，role ∈ {baseline, prior-work, related, motivation, contrast, extends, contradicts}；同义词会被系统归一，但**你输出时也请用标准 role**
+- references **最多 25 条**，只挑最重要的（survey paper 可以全挑 top cites；regular paper 挑 baseline+核心对比+动机即可）
 - methods_used vs methods_proposed 要区分：paper 自己提出的新方法 → proposed；复用他人的方法 → used
 - concepts 控制在 5-10 个，宁少勿滥；不抽形容词、通用词（如 "novel"、"efficient"）
-- context_quote 必须是原文 quote（≤240 字符），不允许改写
+- context_quote 必须是原文 quote **≤240 字符**（硬上限，超过会被截断）
+- tldr **≤280 字符**，problem **≤500 字符**
 - contribution_type ∈ {theory, method, system, survey, dataset, tool}
 - 输出必须是合法的 JSON 对象（**不要 markdown 围栏，不要解释**）
 
@@ -136,7 +187,7 @@ def _truncate(md: str, budget_tokens: int) -> str:
     return head + f"\n\n[...truncated {len(md) - max_chars} chars...]"
 
 
-def _call_llm(user_prompt: str, *, max_tokens: int = 8000, timeout: int = 240) -> str:
+def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) -> str:
     """Send a single prompt and return text response. Raises on HTTP error."""
     messages = [
         {"role": "user", "content": SYSTEM_PROMPT + "\n\n" + user_prompt},
