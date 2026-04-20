@@ -1,25 +1,28 @@
 """
-MinerU-based PDF parser.
+MinerU-based PDF parser with two modes:
 
-MinerU 3.1.0 (上海 AI Lab OpenDataLab) offers LaTeX formula recognition,
-accurate table extraction, multi-column layout, figure captions, and mixed
-CJK/English handling. This is the preferred parser for academic PDFs.
+1. **API mode** (preferred for batch work): POST to a long-running
+   ``mineru-api`` server. Models stay hot → saves ~10s/paper cold-start.
+   Enable via ``MINERU_API_URL`` env (e.g. ``http://127.0.0.1:8765``).
 
-We shell out to the `mineru` CLI rather than calling internal APIs — the CLI
-surface is stable and the internal `mineru.backend.*` modules are not a
-publicly documented contract.
+2. **CLI mode** (fallback, single-shot): shell out to ``mineru`` CLI. Safe
+   for ad-hoc one-off parses but reloads models every call.
 
-Usage:
-    from zotero_mcp.mineru_parser import convert_pdf_mineru
-    md = convert_pdf_mineru("/path/to/paper.pdf")
+Both return the same markdown string. The ``convert_pdf_mineru`` entry point
+auto-picks API mode when ``MINERU_API_URL`` is set and the service is alive.
 """
 from __future__ import annotations
 
+import io
+import json
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -57,6 +60,82 @@ def _find_output_md(out_dir: Path, pdf_stem: str) -> Path | None:
     return any_md[0] if any_md else None
 
 
+# ==========================================================================
+# Multipart-form builder (no external deps) for POSTing to /file_parse
+# ==========================================================================
+def _multipart_body(
+    fields: dict[str, str], files: dict[str, tuple[str, bytes, str]],
+) -> tuple[bytes, str]:
+    """Return (body_bytes, content_type) for an RFC7578 multipart/form-data POST."""
+    boundary = uuid.uuid4().hex
+    buf = io.BytesIO()
+    for name, value in fields.items():
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        buf.write(value.encode())
+        buf.write(b"\r\n")
+    for name, (fname, data, ctype) in files.items():
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(
+            f'Content-Disposition: form-data; name="{name}"; filename="{fname}"\r\n'
+            f"Content-Type: {ctype}\r\n\r\n".encode()
+        )
+        buf.write(data)
+        buf.write(b"\r\n")
+    buf.write(f"--{boundary}--\r\n".encode())
+    return buf.getvalue(), f"multipart/form-data; boundary={boundary}"
+
+
+def convert_pdf_mineru_api(
+    pdf_path: str | Path,
+    *,
+    api_url: str | None = None,
+    backend: str = "pipeline",
+    lang: str = "ch",
+    timeout: int = 600,
+) -> str:
+    """Convert via a running mineru-api server. Much faster for batch work."""
+    api_url = (api_url or os.environ["MINERU_API_URL"]).rstrip("/")
+    pdf = Path(pdf_path).expanduser().resolve()
+    if not pdf.is_file():
+        raise FileNotFoundError(str(pdf))
+    pdf_bytes = pdf.read_bytes()
+
+    body, ctype = _multipart_body(
+        fields={
+            "backend": backend,
+            "parse_method": "auto",
+            "lang_list": lang,       # mineru-api accepts a single string
+            "return_md": "true",
+            "return_middle_json": "false",
+            "return_images": "false",
+            "response_format_zip": "false",
+        },
+        files={"files": (pdf.name, pdf_bytes, "application/pdf")},
+    )
+    req = urllib.request.Request(
+        f"{api_url}/file_parse", data=body, method="POST",
+        headers={"Content-Type": ctype, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body_err = e.read()[:1500].decode("utf-8", errors="replace")
+        raise RuntimeError(f"mineru-api HTTP {e.code}: {body_err}") from e
+
+    # The response wraps results per filename; pick the first md we find.
+    results = data.get("results") or {}
+    for _fname, entry in results.items():
+        md = entry.get("md_content") or entry.get("markdown") or entry.get("md") or ""
+        if md:
+            return md
+    # some versions nest differently
+    if isinstance(data.get("md_content"), str):
+        return data["md_content"]
+    raise RuntimeError(f"mineru-api returned no markdown. Payload: {str(data)[:500]}")
+
+
 def convert_pdf_mineru(
     pdf_path: str | Path,
     *,
@@ -65,24 +144,19 @@ def convert_pdf_mineru(
     lang: str = "ch",
     timeout: int = 600,
 ) -> str:
-    """Convert a PDF to Markdown via MinerU.
+    """Convert a PDF to Markdown. Prefers MINERU_API_URL when set; falls back to CLI.
 
-    Args:
-        pdf_path: Path to the input PDF.
-        backend: MinerU backend. Default `hybrid-auto-engine` is the most
-            accurate local option in 3.1.0.
-        method: pdf parsing method; auto/txt/ocr.
-        lang: OCR language hint; `ch` handles Chinese+English reasonably.
-        timeout: Subprocess timeout in seconds (default 10 min per paper).
-
-    Returns:
-        The full markdown text.
-
-    Raises:
-        FileNotFoundError: input PDF missing.
-        RuntimeError: MinerU binary missing or produced no markdown.
-        subprocess.TimeoutExpired: conversion took too long.
+    CLI keeps the same defaults (pipeline backend; auto parse method; Chinese
+    language hint works for mixed zh/en papers).
     """
+    if os.environ.get("MINERU_API_URL"):
+        try:
+            return convert_pdf_mineru_api(
+                pdf_path, backend=backend, lang=lang, timeout=timeout,
+            )
+        except Exception as e:
+            logger.warning("mineru-api failed, falling back to CLI: %s", e)
+
     pdf = Path(pdf_path).expanduser().resolve()
     if not pdf.is_file():
         raise FileNotFoundError(str(pdf))
@@ -91,16 +165,11 @@ def convert_pdf_mineru(
         out_dir = Path(td)
         cmd = [
             _mineru_bin(),
-            "-p", str(pdf),
-            "-o", str(out_dir),
-            "-b", backend,
-            "-m", method,
-            "-l", lang,
+            "-p", str(pdf), "-o", str(out_dir),
+            "-b", backend, "-m", method, "-l", lang,
         ]
-        logger.info("running mineru: %s", " ".join(cmd))
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-        )
+        logger.info("running mineru CLI: %s", " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             raise RuntimeError(
                 f"mineru failed (exit {result.returncode}): "

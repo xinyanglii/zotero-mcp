@@ -30,6 +30,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .extractor import extract_structured
@@ -154,6 +155,37 @@ def _zotero_cloud_fetch(attachment_key: str) -> bytes | None:
 # ======================================================================
 # Main pipeline
 # ======================================================================
+def _metadata_only_markdown(item: dict) -> str:
+    """Synthesize a minimal markdown doc from Zotero metadata + abstract.
+
+    Used when no PDF is reachable. Better than dropping the item entirely —
+    the abstract alone lets Kimi pull concepts, datasets, and (sometimes)
+    methods; the citation graph still gets its :Source node.
+    """
+    parts = [f"# {item.get('title','')}", ""]
+    creators = item.get("creators") or []
+    if creators:
+        authors = ", ".join(
+            (c.get("lastName") or c.get("name","")).strip()
+            for c in creators if c.get("creatorType") == "author"
+        )
+        parts += [f"**Authors:** {authors}", ""]
+    date = item.get("date") or ""
+    venue = item.get("publicationTitle") or item.get("conferenceName") or ""
+    if date or venue:
+        parts += [f"**Venue:** {venue}  **Year:** {date}", ""]
+    doi = item.get("DOI") or ""
+    if doi:
+        parts += [f"**DOI:** {doi}", ""]
+    abstract = item.get("abstractNote") or ""
+    if abstract:
+        parts += ["## Abstract", abstract, ""]
+    extra = item.get("extra") or ""
+    if extra:
+        parts += ["## Notes", extra, ""]
+    return "\n".join(parts)
+
+
 def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | float | int]:
     """Process a single item. Returns stats dict."""
     pid = item["key"]
@@ -165,27 +197,43 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         return stats
 
     pdf = resolve_pdf_bytes(item)
-    if pdf is None:
-        sql.record_failure(pid, "pdf_resolve", "no PDF available")
-        stats["status"] = "skip_no_pdf"
-        return stats
-    tmp_pdf = work_tmp / f"{pid}.pdf"
-    tmp_pdf.write_bytes(pdf)
+    mineru_secs = 0.0
+    metadata_only = False
+    md = None
 
-    t_mineru = time.time()
-    try:
-        md = convert_to_markdown_smart(tmp_pdf)
-    except Exception as e:
-        sql.record_failure(pid, "parse", repr(e)[:400])
-        stats["status"] = "parse_err"
-        return stats
-    finally:
-        tmp_pdf.unlink(missing_ok=True)
-    mineru_secs = time.time() - t_mineru
-    if not md or len(md) < 500:
-        sql.record_failure(pid, "parse", f"md too short: {len(md) if md else 0}")
-        stats["status"] = "parse_empty"
-        return stats
+    if pdf is None:
+        # graceful degrade: build metadata-only md from abstract + Zotero fields
+        md = _metadata_only_markdown(item)
+        metadata_only = True
+        if len(md.strip()) < 120:  # title-only with no abstract → really nothing
+            sql.record_failure(pid, "no_content",
+                               "no PDF and no abstract/metadata body")
+            stats["status"] = "skip_no_content"
+            return stats
+        stats["mode"] = "meta_only"
+    else:
+        tmp_pdf = work_tmp / f"{pid}.pdf"
+        tmp_pdf.write_bytes(pdf)
+        t_mineru = time.time()
+        try:
+            md = convert_to_markdown_smart(tmp_pdf)
+        except Exception as e:
+            sql.record_failure(pid, "parse", repr(e)[:400])
+            stats["status"] = "parse_err"
+            return stats
+        finally:
+            tmp_pdf.unlink(missing_ok=True)
+        mineru_secs = time.time() - t_mineru
+        if not md or len(md) < 500:
+            # parse produced nothing useful → fall through to metadata-only
+            md = _metadata_only_markdown(item)
+            metadata_only = True
+            stats["mode"] = "meta_fallback"
+            if len(md.strip()) < 120:
+                sql.record_failure(pid, "no_content",
+                                   f"parse empty ({len(md) if md else 0}) and no metadata")
+                stats["status"] = "skip_no_content"
+                return stats
 
     t_llm = time.time()
     paper = extract_structured(md, title=item.get("title", ""), paper_id=pid)
@@ -229,6 +277,9 @@ def main():
     ap.add_argument("--qdrant-port", type=int, default=6333)
     ap.add_argument("--qdrant-collection", default="zotero_library")
     ap.add_argument("--keys", nargs="+", default=None, help="specific Zotero keys")
+    ap.add_argument("--workers", type=int,
+                    default=int(os.environ.get("INGEST_WORKERS", "3")),
+                    help="Concurrent pipeline workers (MinerU API caps at 3)")
     args = ap.parse_args()
 
     _z_init()
@@ -253,15 +304,35 @@ def main():
     work_tmp.mkdir(exist_ok=True)
 
     stats_per_status: dict[str, int] = {}
-    for i, it in enumerate(items, 1):
-        t = time.time()
-        s = ingest_one(it, sql=sql, qd=qd, ne=ne, work_tmp=work_tmp)
-        stats_per_status[s["status"]] = stats_per_status.get(s["status"], 0) + 1
-        logger.info("[%d/%d] %s %s", i, len(items), it["key"], s)
+    t0 = time.time()
+    if args.workers <= 1:
+        for i, it in enumerate(items, 1):
+            s = ingest_one(it, sql=sql, qd=qd, ne=ne, work_tmp=work_tmp)
+            stats_per_status[s["status"]] = stats_per_status.get(s["status"], 0) + 1
+            logger.info("[%d/%d] %s %s", i, len(items), it["key"], s)
+    else:
+        logger.info("running with %d concurrent workers", args.workers)
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(ingest_one, it, sql=sql, qd=qd, ne=ne,
+                                work_tmp=work_tmp): it for it in items}
+            for i, fut in enumerate(as_completed(futs), 1):
+                it = futs[fut]
+                try:
+                    s = fut.result()
+                except Exception as e:
+                    s = {"pid": it["key"], "status": "crash", "err": repr(e)[:200]}
+                stats_per_status[s["status"]] = stats_per_status.get(s["status"], 0) + 1
+                elapsed = time.time() - t0
+                rate = i / elapsed if elapsed > 0 else 0
+                eta = (len(items) - i) / rate if rate > 0 else 0
+                logger.info("[%d/%d @ %.0f%%] %s %s  rate=%.2f/s  ETA=%.0fm",
+                            i, len(items), 100*i/len(items), it["key"], s,
+                            rate, eta/60)
 
     sql.close()
     ne.close()
-    logger.info("DONE. status breakdown: %s", stats_per_status)
+    logger.info("DONE in %.1fm. status breakdown: %s", (time.time()-t0)/60,
+                stats_per_status)
 
 
 if __name__ == "__main__":

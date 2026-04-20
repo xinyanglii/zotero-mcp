@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -59,16 +60,21 @@ class SQLiteStore:
     def __init__(self, db_path: str | Path):
         self.path = Path(db_path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # check_same_thread=False so the ThreadPoolExecutor workers can share the
+        # connection; writes serialized via self._lock, so we stay consistent.
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.executescript(self.SCHEMA)
         self.conn.commit()
+        self._lock = threading.Lock()
 
     def close(self):
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def already_done(self, paper_id: str) -> bool:
-        c = self.conn.execute("SELECT 1 FROM papers WHERE paper_id=?", (paper_id,))
-        return c.fetchone() is not None
+        with self._lock:
+            c = self.conn.execute("SELECT 1 FROM papers WHERE paper_id=?", (paper_id,))
+            return c.fetchone() is not None
 
     def save_paper(
         self,
@@ -79,26 +85,28 @@ class SQLiteStore:
         mineru_secs: float = 0.0,
         llm_secs: float = 0.0,
     ):
-        self.conn.execute(
-            """INSERT OR REPLACE INTO papers
-               (paper_id, item_type, title, year, md_chars, md_text,
-                extracted_json, ingested_at, mineru_secs, llm_secs,
-                llm_input_tokens, llm_output_tokens)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                paper.paper_id, item_type, paper.title, paper.year,
-                len(md_text), md_text, paper.model_dump_json(),
-                time.time(), mineru_secs, llm_secs, 0, 0,
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO papers
+                   (paper_id, item_type, title, year, md_chars, md_text,
+                    extracted_json, ingested_at, mineru_secs, llm_secs,
+                    llm_input_tokens, llm_output_tokens)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    paper.paper_id, item_type, paper.title, paper.year,
+                    len(md_text), md_text, paper.model_dump_json(),
+                    time.time(), mineru_secs, llm_secs, 0, 0,
+                ),
+            )
+            self.conn.commit()
 
     def record_failure(self, paper_id: str, stage: str, err: str):
-        self.conn.execute(
-            "INSERT INTO failures(paper_id,stage,err,ts) VALUES (?,?,?,?)",
-            (paper_id, stage, err[:2000], time.time()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO failures(paper_id,stage,err,ts) VALUES (?,?,?,?)",
+                (paper_id, stage, err[:2000], time.time()),
+            )
+            self.conn.commit()
 
 
 # ======================================================================
