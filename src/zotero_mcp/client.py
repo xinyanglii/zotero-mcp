@@ -412,18 +412,11 @@ def get_attachment_details(
 
 
 def convert_to_markdown(file_path: str | Path) -> str:
-    """
-    Convert a file to markdown using markitdown library.
+    """Convert a file to markdown.
 
-    Args:
-        file_path: Path to the file to convert.
-
-    Returns:
-        Markdown text.
+    Dispatches via `parser_factory` so PDFs route to MinerU (academic-grade
+    formula/table/layout fidelity) while non-PDFs continue to use markitdown.
     """
-    try:
-        md = MarkItDown()
-        result = md.convert(str(file_path))
-        return result.text_content
-    except Exception as e:
-        return f"Error converting file to markdown: {str(e)}"
+    from .parser_factory import convert_to_markdown_smart
+
+    return convert_to_markdown_smart(file_path)
