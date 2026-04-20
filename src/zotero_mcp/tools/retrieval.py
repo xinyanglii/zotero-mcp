@@ -91,6 +91,36 @@ def get_item_fulltext(
         # Get item metadata in markdown format
         metadata = _client.format_item_metadata(item, include_abstract=True)
 
+        # ==========================================================
+        # FAST PATH: pre-extracted markdown child attachment
+        # ==========================================================
+        # When the ingest pipeline has already parsed this paper (see the
+        # ``kg:extracted_md`` tag on the parent), a child attachment with
+        # ``contentType=text/markdown`` lives on WebDAV. Fetching it skips
+        # re-running MinerU on every fulltext request — several orders of
+        # magnitude faster than downloading the PDF and re-parsing.
+        try:
+            from zotero_mcp import webdav as _webdav
+            if _webdav.webdav_enabled():
+                children = zot.children(item_key)
+                md_atts = [
+                    c for c in children
+                    if c.get("data", {}).get("itemType") == "attachment"
+                    and c.get("data", {}).get("contentType") == "text/markdown"
+                ]
+                if md_atts:
+                    att_key = md_atts[0].get("key") or md_atts[0]["data"].get("key")
+                    md_bytes = _webdav.fetch_attachment_bytes(att_key)
+                    if md_bytes:
+                        ctx.info(f"Fulltext via WebDAV md attachment {att_key} (fast path)")
+                        return _helpers._prepend_size_warning(
+                            f"{metadata}\n\n---\n\n## Full Text (pre-extracted)\n\n"
+                            f"{md_bytes.decode('utf-8', errors='replace')}",
+                            "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                        )
+        except Exception as e:
+            ctx.info(f"WebDAV md fast path unavailable, falling through: {e}")
+
         # In local mode, prefer direct local DB/storage extraction first.
         # This avoids pyzotero dump() failures on linked file:// attachments
         # when using remote clients over SSE/HTTP.
@@ -171,10 +201,25 @@ def get_item_fulltext(
             ctx.info(f"Attempting to download and convert attachment {attachment.key}")
 
             # Download the file to a temporary location
-
             with tempfile.TemporaryDirectory() as tmpdir:
                 file_path = os.path.join(tmpdir, attachment.filename or f"{attachment.key}.pdf")
-                zot.dump(attachment.key, filename=os.path.basename(file_path), path=tmpdir)
+
+                # Prefer WebDAV (Zotero cloud /file endpoint returns empty for
+                # users whose storage is configured to WebDAV).
+                downloaded = False
+                try:
+                    from zotero_mcp import webdav as _webdav
+                    if _webdav.webdav_enabled():
+                        raw = _webdav.fetch_attachment_bytes(attachment.key)
+                        if raw:
+                            Path(file_path).write_bytes(raw)
+                            downloaded = True
+                            ctx.info(f"Downloaded via WebDAV ({len(raw)/1024:.0f} KB)")
+                except Exception as wd_err:
+                    ctx.info(f"WebDAV download failed, falling back to Zotero cloud: {wd_err}")
+
+                if not downloaded:
+                    zot.dump(attachment.key, filename=os.path.basename(file_path), path=tmpdir)
 
                 if os.path.exists(file_path):
                     ctx.info(f"Downloaded file to {file_path}, converting to markdown")

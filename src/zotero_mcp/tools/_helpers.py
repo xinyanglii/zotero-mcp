@@ -215,7 +215,14 @@ def _normalize_arxiv_id(raw):
 # ---------------------------------------------------------------------------
 
 def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
-    """Download a PDF from a URL and attach it to a Zotero item."""
+    """Download a PDF from a URL and attach it to a Zotero item.
+
+    Prefers WebDAV (Zotero-native sync format) when
+    ``ZOTERO_WEBDAV_USER/PASS`` are set — see this repo's hard rule that
+    PDFs live on Jianguoyun WebDAV, not the Zotero cloud 300MB free tier.
+    Falls back to ``attachment_both`` (uploads to Zotero's own storage)
+    when WebDAV is not configured.
+    """
     try:
         pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
         pdf_resp.raise_for_status()
@@ -225,17 +232,34 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
             ctx.info(f"URL did not return a PDF (Content-Type: {content_type})")
             return False
 
+        pdf_bytes = pdf_resp.content
+        if len(pdf_bytes) < 1000:
+            ctx.info("Downloaded file too small, likely not a real PDF")
+            return False
+
+        # Preferred path: Jianguoyun-style WebDAV (matches user's real storage)
+        from zotero_mcp import webdav as _webdav
+        if _webdav.webdav_enabled():
+            att_key = _webdav.create_zotero_webdav_attachment(
+                write_zot,
+                parent_key=item_key,
+                file_bytes=pdf_bytes,
+                filename="document.pdf",
+                content_type="application/pdf",
+                title="PDF",
+                extra_tags=["kg:auto_filled"],
+            )
+            if att_key:
+                ctx.info(f"PDF attached via WebDAV ({att_key}, {len(pdf_bytes)/1024:.0f} KB)")
+                return True
+            ctx.info("WebDAV attach failed; falling back to Zotero cloud")
+
+        # Fallback: Zotero cloud upload via pyzotero
         with tempfile.TemporaryDirectory() as tmpdir:
             filename = f"{doi.replace('/', '_')}.pdf"
             filepath = os.path.join(tmpdir, filename)
             with open(filepath, "wb") as f:
-                for chunk in pdf_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            if os.path.getsize(filepath) < 1000:
-                ctx.info("Downloaded file too small, likely not a real PDF")
-                return False
-
+                f.write(pdf_bytes)
             write_zot.attachment_both(
                 [(filename, filepath)],
                 parentid=item_key,
