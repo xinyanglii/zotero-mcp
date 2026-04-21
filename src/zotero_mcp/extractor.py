@@ -63,18 +63,6 @@ PROVIDER_CHAIN = [
         "protocol":  "anthropic",
     },
     {
-        "name":      "kimi-k2.5",
-        # Kimi K2.5 hosted on Alibaba DashScope (OpenAI-compat). Same model
-        # family as primary — tldr/methods_used density matches (7 methods_used,
-        # 10/10 schema fields, 253/298 char tldr/problem on benchmark). ~23s/
-        # paper. Pay-per-use (est. ~¥0.02-0.05/paper) so no daily cap. Best
-        # 2nd choice when coding-plan is exhausted.
-        "url":       os.getenv("KIMI_K25_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     os.getenv("KIMI_K25_MODEL", "kimi-k2.5"),
-        "key_envs":  ("DASHSCOPE_API_KEY",),
-        "protocol":  "openai",
-    },
-    {
         "name":      "qwen3max",
         # DashScope qwen3-max (1M tokens free quota, ~915k remaining as of
         # 2026-04-21, expires 2026-06-24). ~20s/paper, 8-10/10 fields, often
