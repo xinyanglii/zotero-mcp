@@ -54,30 +54,43 @@ SCHEMA_ERR_LOG = Path(os.getenv(
 PROVIDER_CHAIN = [
     {
         "name":      "kimi",
+        # Moonshot Kimi coding subscription (currently K2.6). ~17s/paper on
+        # real 20KB markdown, highest quality tldr/methods_used. Anthropic
+        # protocol. Primary when quota available.
         "url":       os.getenv("KIMI_URL", "https://api.kimi.com/coding/v1/messages"),
         "model":     os.getenv("KIMI_MODEL", "kimi-for-coding"),
         "key_envs":  ("KIMI_API_KEY", "MOONSHOT_API_KEY"),
-        "protocol":  "anthropic",  # x-api-key header, Anthropic message schema
+        "protocol":  "anthropic",
     },
     {
-        "name":      "zai",
-        # Z.AI coding-plan endpoint (separate quota from paas/v4). OpenAI-compat
-        # schema, Bearer auth. glm-5 (alias of glm-5.1) matches Kimi extraction
-        # quality in spot tests and the coding plan has generous daily quota.
-        "url":       os.getenv("ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"),
-        "model":     os.getenv("ZAI_MODEL", "glm-5"),
-        "key_envs":  ("Z_AI_API_KEY", "ZAI_API_KEY"),
+        "name":      "kimi-k2.5",
+        # Kimi K2.5 hosted on Alibaba DashScope (OpenAI-compat). Same model
+        # family as primary — tldr/methods_used density matches (7 methods_used,
+        # 10/10 schema fields, 253/298 char tldr/problem on benchmark). ~23s/
+        # paper. Pay-per-use (est. ~¥0.02-0.05/paper) so no daily cap. Best
+        # 2nd choice when coding-plan is exhausted.
+        "url":       os.getenv("KIMI_K25_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     os.getenv("KIMI_K25_MODEL", "kimi-k2.5"),
+        "key_envs":  ("DASHSCOPE_API_KEY",),
         "protocol":  "openai",
     },
     {
         "name":      "qwen3max",
-        # DashScope's flagship general-purpose (qwen-plus quota was consumed on
-        # 2026-04-21, qwen3-max is the next-best with Kimi-parity quality and
-        # fast response (~16s/paper in spot tests). Last-resort fallback if
-        # both Kimi (subscription 429) and Z.AI (coding-plan daily cap) fail.
+        # DashScope qwen3-max — ~20s/paper, 8/10 fields, faster than k2.5 but
+        # slightly lower methods density. 3rd slot for throughput rescue.
         "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
         "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "zai",
+        # Z.AI GLM-5 (coding plan, free daily quota). ~82s/paper due to heavy
+        # reasoning tokens (3000+). Slowest but kept as last-resort free
+        # fallback if all paid providers are exhausted.
+        "url":       os.getenv("ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"),
+        "model":     os.getenv("ZAI_MODEL", "glm-5"),
+        "key_envs":  ("Z_AI_API_KEY", "ZAI_API_KEY"),
         "protocol":  "openai",
     },
 ]
