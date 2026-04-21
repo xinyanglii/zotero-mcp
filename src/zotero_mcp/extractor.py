@@ -69,6 +69,17 @@ PROVIDER_CHAIN = [
         "key_envs":  ("Z_AI_API_KEY", "ZAI_API_KEY"),
         "protocol":  "openai",
     },
+    {
+        "name":      "qwen3max",
+        # DashScope's flagship general-purpose (qwen-plus quota was consumed on
+        # 2026-04-21, qwen3-max is the next-best with Kimi-parity quality and
+        # fast response (~16s/paper in spot tests). Last-resort fallback if
+        # both Kimi (subscription 429) and Z.AI (coding-plan daily cap) fail.
+        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
 ]
 
 
