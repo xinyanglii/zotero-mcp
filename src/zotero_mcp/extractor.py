@@ -76,10 +76,36 @@ PROVIDER_CHAIN = [
     },
     {
         "name":      "qwen3max",
-        # DashScope qwen3-max — ~20s/paper, 8/10 fields, faster than k2.5 but
-        # slightly lower methods density. 3rd slot for throughput rescue.
+        # DashScope qwen3-max (1M tokens free quota, ~915k remaining as of
+        # 2026-04-21, expires 2026-06-24). ~20s/paper, 8-10/10 fields, often
+        # even higher methods_used density than k2.5 (observed 10.3 avg vs
+        # 8.0). Effective 2nd-3rd slot.
         "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "qwen3max-preview",
+        # Separate 1M free quota independent of qwen3-max. Expires 2026-06-24.
+        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     "qwen3-max-preview",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "qwen3max-0923",
+        # Pinned snapshot, separate 1M free quota. Expires 2026-06-24.
+        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     "qwen3-max-2025-09-23",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "qwen3max-0123",
+        # Newer pinned snapshot. Expect similar 1M free quota.
+        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
+        "model":     "qwen3-max-2026-01-23",
         "key_envs":  ("DASHSCOPE_API_KEY",),
         "protocol":  "openai",
     },
