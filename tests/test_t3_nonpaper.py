@@ -20,6 +20,8 @@ from zotero_mcp.ingest import (
     T3_NON_PAPER_TYPES,
     fetch_markdown_via_markitdown,
     fetch_snapshot_markdown,
+    _auth_cookies_for_url,
+    _convert_cookies_chrome_to_playwright,
 )
 from zotero_mcp.extractor import (
     NON_PAPER_HINT,
@@ -293,6 +295,84 @@ def test_snapshot_webdav_fetch_error_returns_empty(monkeypatch):
         raise webdav.WebDAVOutageError("503 persistent")
     monkeypatch.setattr(webdav, "fetch_attachment_bytes", _raise)
     assert fetch_snapshot_markdown("T3ITEM") == ""
+
+
+# ---------------------------------------------------------------------------
+# Cookie-Editor → Playwright converter (T3 Tier 1.5)
+# ---------------------------------------------------------------------------
+def test_convert_cookies_basic_fields():
+    raw = [{
+        "name": "z_c0", "value": "abc123",
+        "domain": ".zhihu.com", "path": "/",
+        "httpOnly": True, "secure": True,
+        "sameSite": "unspecified",
+        "expirationDate": 1791930065.246555,
+        "session": False,
+    }]
+    out = _convert_cookies_chrome_to_playwright(raw)
+    assert len(out) == 1
+    c = out[0]
+    assert c["name"] == "z_c0"
+    assert c["value"] == "abc123"
+    assert c["domain"] == ".zhihu.com"
+    assert c["httpOnly"] is True
+    assert c["secure"] is True
+    assert c["sameSite"] == "Lax"  # unspecified → Lax
+    assert c["expires"] == 1791930065.246555
+
+
+def test_convert_cookies_samesite_mapping():
+    raw = [
+        {"name": "a", "value": "1", "domain": "x.com", "sameSite": "no_restriction"},
+        {"name": "b", "value": "2", "domain": "x.com", "sameSite": "lax"},
+        {"name": "c", "value": "3", "domain": "x.com", "sameSite": "strict"},
+        {"name": "d", "value": "4", "domain": "x.com", "sameSite": "unspecified"},
+    ]
+    out = _convert_cookies_chrome_to_playwright(raw)
+    assert [c["sameSite"] for c in out] == ["None", "Lax", "Strict", "Lax"]
+
+
+def test_convert_cookies_session_cookie_expires_minus_one():
+    """session-only cookies (no expirationDate) → Playwright expires=-1."""
+    raw = [{"name": "s", "value": "v", "domain": "x.com", "session": True}]
+    out = _convert_cookies_chrome_to_playwright(raw)
+    assert out[0]["expires"] == -1
+
+
+# ---------------------------------------------------------------------------
+# _auth_cookies_for_url — host gating for Tier 1.5
+# ---------------------------------------------------------------------------
+def test_auth_cookies_for_zhihu_url_hits(monkeypatch, tmp_path):
+    """URL matching a configured host should return the cookie path."""
+    cookies_file = tmp_path / "zhihu.json"
+    cookies_file.write_text("[]")
+    monkeypatch.setenv("T3_AUTH_COOKIES", f"zhihu.com:{cookies_file}")
+    assert _auth_cookies_for_url("https://zhuanlan.zhihu.com/p/1") == str(cookies_file)
+    assert _auth_cookies_for_url("https://www.zhihu.com/answer/1") == str(cookies_file)
+
+
+def test_auth_cookies_for_nonmatching_url_misses(monkeypatch, tmp_path):
+    cookies_file = tmp_path / "zhihu.json"
+    cookies_file.write_text("[]")
+    monkeypatch.setenv("T3_AUTH_COOKIES", f"zhihu.com:{cookies_file}")
+    assert _auth_cookies_for_url("https://en.wikipedia.org/wiki/X") is None
+    assert _auth_cookies_for_url("https://example.com") is None
+
+
+def test_auth_cookies_for_missing_file_returns_none(monkeypatch):
+    """Config entry points to nonexistent file → return None, don't crash."""
+    monkeypatch.setenv("T3_AUTH_COOKIES", "zhihu.com:/no/such/path.json")
+    assert _auth_cookies_for_url("https://zhuanlan.zhihu.com/p/1") is None
+
+
+def test_auth_cookies_empty_config_disables(monkeypatch):
+    monkeypatch.setenv("T3_AUTH_COOKIES", "")
+    # Default map has zhihu.com but if user's config file doesn't exist locally,
+    # returns None
+    import os
+    # Set to something definitely not present
+    monkeypatch.setenv("T3_AUTH_COOKIES", "zhihu.com:/nonexistent/zhihu.json")
+    assert _auth_cookies_for_url("https://zhihu.com/x") is None
 
 
 def test_non_paper_hint_not_prepended_when_hint_is_none(monkeypatch):

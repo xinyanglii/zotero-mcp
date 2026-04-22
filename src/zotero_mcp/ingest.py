@@ -176,6 +176,128 @@ T3_UA_BROWSER = (
 T3_FETCH_TIMEOUT = int(os.environ.get("T3_FETCH_TIMEOUT", "30"))
 T3_MD_ACCEPT_LEN = int(os.environ.get("T3_MD_ACCEPT_LEN", "500"))
 
+# T3 Tier 1.5: cookie-aware Playwright fetch for login-walled domains.
+# Maps {hostname suffix → path to Cookie-Editor JSON export}. Only domains
+# listed here go through the headless-browser + cookies path; all others
+# stay on the plain urllib tier. This keeps browser launch overhead off the
+# hot path for the 90%+ of URLs that don't need it.
+T3_AUTH_COOKIE_MAP_DEFAULT = {
+    "zhihu.com": "~/.config/zotero-kg/zhihu_cookies.json",
+}
+
+
+def _parse_cookie_map_env() -> dict[str, str]:
+    """Optional env override for T3_AUTH_COOKIES:
+        T3_AUTH_COOKIES="zhihu.com:~/.config/zotero-kg/zhihu.json;weibo.com:/etc/..."
+    """
+    raw = os.environ.get("T3_AUTH_COOKIES", "").strip()
+    if not raw:
+        return dict(T3_AUTH_COOKIE_MAP_DEFAULT)
+    out: dict[str, str] = {}
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        host, path = entry.split(":", 1)
+        out[host.strip()] = path.strip()
+    return out
+
+
+def _auth_cookies_for_url(url: str) -> str | None:
+    """Return cookie-JSON path if URL's host matches an auth-cookie entry."""
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return None
+    for suffix, path in _parse_cookie_map_env().items():
+        if host == suffix or host.endswith("." + suffix):
+            expanded = os.path.expanduser(path)
+            if os.path.isfile(expanded):
+                return expanded
+    return None
+
+
+def _convert_cookies_chrome_to_playwright(raw: list[dict]) -> list[dict]:
+    """Translate Cookie-Editor JSON (Chrome extension format) into the
+    shape ``BrowserContext.add_cookies`` expects."""
+    out = []
+    ss_map = {"no_restriction": "None", "unspecified": "Lax",
+              "lax": "Lax", "strict": "Strict"}
+    for c in raw:
+        pc = {
+            "name": c["name"], "value": c["value"],
+            "domain": c["domain"], "path": c.get("path", "/"),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+            "sameSite": ss_map.get(c.get("sameSite", "unspecified"), "Lax"),
+        }
+        pc["expires"] = (c["expirationDate"]
+                         if not c.get("session") and "expirationDate" in c
+                         else -1)
+        out.append(pc)
+    return out
+
+
+def fetch_markdown_via_playwright_cookies(url: str, cookie_json_path: str) -> str:
+    """T3 Tier 1.5: headless Chrome with user-supplied cookies → markdown.
+
+    Only invoked when ``_auth_cookies_for_url(url)`` returns a path (i.e.
+    host matches a known cookie-walled site like zhihu.com). Cookies are
+    exported by the user via the Cookie-Editor Chrome extension from a
+    browser where they are actively logged in; stored at a 600-perm file
+    under ~/.config/zotero-kg/.
+
+    Blocking constraint: the cookie file may expire (Zhihu z_c0 is ~6-12
+    months; auto-renewed on user activity). On auth failure (login wall
+    in body text) we return "" so caller falls through to
+    snapshot / metadata-only fallback.
+
+    Page-load strategy: ``wait_until='domcontentloaded'`` + 3s settle.
+    networkidle hangs because Zhihu's ad/tracker beacons never stop.
+    """
+    import json as _json
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("T3 Playwright not available, skipping cookie fetch")
+        return ""
+    try:
+        cookies_raw = _json.loads(Path(cookie_json_path).read_text())
+    except Exception as e:
+        logger.warning("T3 cookie file unreadable (%s): %s", cookie_json_path, e)
+        return ""
+    cookies = _convert_cookies_chrome_to_playwright(cookies_raw)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox", "--disable-blink-features=AutomationControlled",
+            ])
+            ctx = browser.new_context(
+                user_agent=T3_UA_BROWSER,
+                locale="zh-CN",
+                viewport={"width": 1280, "height": 800},
+            )
+            ctx.add_cookies(cookies)
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                page.wait_for_timeout(3000)   # let React render article body
+                body_text = page.evaluate("() => document.body.innerText")
+            finally:
+                browser.close()
+    except Exception as e:
+        logger.warning("T3 Playwright fetch fail %s: %s", url, e)
+        return ""
+
+    # Auth-expired detection: common "please log in" markers in first 500 chars
+    head = (body_text or "")[:500]
+    if any(m in head for m in ("请您登录", "立即登录", "请登录后")):
+        logger.warning("T3 Playwright %s hit login wall — cookies may be expired", url)
+        return ""
+    return body_text or ""
+
 
 def fetch_snapshot_markdown(item_key: str) -> str:
     """T3 Tier 2: load a Zotero child HTML snapshot attachment and parse it.
@@ -715,7 +837,7 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         md_source = None   # "url_fetch" | "snapshot" | None
 
         if is_t3:
-            # Tier 1: live URL fetch
+            # Tier 1: live URL fetch (plain urllib+UA → markitdown)
             if url:
                 fetched = fetch_markdown_via_markitdown(url)
                 fetched_len = len(fetched.strip())
@@ -727,8 +849,23 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
                     stats["fetch_status"] = ("too_short" if fetched else
                                               ("fail" if url else "no_url"))
 
-            # Tier 2: snapshot attachment (only when Tier 1 didn't produce
-            # usable content). Might be stale but at least gets past 403s.
+            # Tier 1.5: cookie-aware Playwright for login-walled domains
+            # (zhihu.com etc.). Only runs when Tier 1 didn't produce usable
+            # content AND the URL's host has a configured auth-cookie file.
+            if not md_candidate and url:
+                cookie_path = _auth_cookies_for_url(url)
+                if cookie_path:
+                    pw_md = fetch_markdown_via_playwright_cookies(url, cookie_path)
+                    pw_len = len(pw_md.strip())
+                    stats["playwright_len"] = pw_len
+                    if pw_md and pw_len >= T3_MD_ACCEPT_LEN:
+                        md_candidate = pw_md
+                        md_source = "playwright_cookies"
+
+            # Tier 2: snapshot attachment (only when Tiers 1 + 1.5 didn't
+            # produce usable content). Might be stale but at least gets past
+            # 403s / login walls for sites where we DIDN'T configure cookies
+            # OR where our cookies expired.
             if not md_candidate:
                 snap = fetch_snapshot_markdown(pid)
                 snap_len = len(snap.strip())
