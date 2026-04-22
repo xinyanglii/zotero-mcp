@@ -1,3 +1,28 @@
+# Zotero MCP (qdrant-backend fork) — Chat with your Research Library + Knowledge Graph
+
+> **This is the `xinyanglii/zotero-mcp` fork on branch `qdrant-backend`**, diverging from the upstream `54yyyu/zotero-mcp` with a production-grade knowledge-graph ingest pipeline. The upstream README below describes the base MCP server; the fork-specific pieces are summarised first.
+
+## Fork additions (not in upstream)
+
+Ingest pipeline turns every Zotero item into a 4-store artifact: **SQLite** (provenance + failures), **Qdrant** `zotero_library` (dense Qwen v4 + BM25 sparse hybrid), **Neo4j** `zotero-kg` graph (`:Paper` / `:Webpage` / `:CodeRepo` / `:Concept` / `:Method` / `:Dataset` / `:ExternalRef` + `CITES` / `ABOUT` / `USES` / `SAME_WORK_AS` / `SAME_AS` / `IMPLEMENTED_BY` / `EVALUATES_ON` / `PROPOSES` / `AUTHORED` / `PUBLISHED_AT` edges), and **WebDAV** (markdown attachment persisted on Jianguoyun).
+
+Shipped phases (all live on master):
+- **T0** — MinerU-parsed PDFs with figure extraction; VLM-capable extractor chain (`kimi-vl` → `zai glm-5` → `qwen-plus` snapshots → `qwen3-coder-plus`).
+- **T1** — Stable identifiers: `normalize_doi` / `normalize_arxiv`, paper-level `doi` / `arxiv_id` with 3 Neo4j range indexes, `SAME_WORK_AS` edge-builder spanning Paper/ExternalRef; `scripts/backfill_paper_identifiers.py` + `scripts/crossref_enrich_refs.py` populate coverage across the existing library via the CrossRef polite pool.
+- **T3** — Non-PDF itemTypes (`webpage`, `blogPost`, `software`, `computerProgram`, 8 more). Four-tier fetch: markitdown → Playwright+cookies (Zhihu / 小红书 etc.) → Zotero HTML snapshot → metadata-only.
+- **T4** — `scripts/link_papers_to_coderepo.py`: regex-scan `papers.md_text` for GitHub URLs, `IMPLEMENTED_BY` edges with reserved-owner blacklist + deterministic MERGE.
+- **T8** — `scripts/backfill_datasets.py`: 17 canonical benchmarks (ImageNet / KITTI / GLUE / DeepMIMO / QuaDRiGa …) via anchored alias regex, `EVALUATES_ON` edges tagged `regex_backfill`.
+- **T2** — `scripts/canonicalize_entities.py`: Qwen v4 embedding + per-label batched cosine + kimi-for-coding judge for the 0.85-0.92 gray zone; writes `SAME_AS` edges across Concept/Method/Dataset with deterministic `min(canonical_name) → max` direction.
+
+Orchestration wrapper: `~/.claude/skills/zotero-kg/scripts/zkg.py` (ingest_one / ingest_all / ingest_supervised / stats --detailed / verify / backfill). See `plans/zotero-kg-todo.md` in the companion `claude-workspace` repo for roadmap (T5 fuzzy-hash dedup, T6 unified Web UI, T7 multimodal re-parse, T10 proceedings auto-ingest).
+
+New env vars beyond upstream:
+`NEO4J_ZOTERO_{URI,USER,PASSWORD}` · `QDRANT_{HOST,PORT,COLLECTION}` · `ZOTERO_WEBDAV_{USER,PASS}` (URL defaults `https://dav.jianguoyun.com/dav/zotero`) · `KIMI_API_KEY` · `DASHSCOPE_API_KEY` · `Z_AI_API_KEY` · `CROSSREF_MAILTO`.
+
+---
+
+# Upstream README follows
+
 # Zotero MCP: Chat with your Research Library—Local or Web—in Claude, ChatGPT, and more.
 
 <p align="center">
