@@ -451,6 +451,53 @@ class QdrantWriter:
 # ======================================================================
 # Neo4jWriter — MERGE nodes + relations
 # ======================================================================
+# ======================================================================
+# T3 · itemType → Neo4j label hierarchy
+# ======================================================================
+# Wiki §4.2 enumerates allowed :Source sub-labels:
+#     :Paper | :Book | :Thesis | :Webpage | :CodeRepo | :ExternalRef
+# For v1 we only branch to :Paper, :Webpage, :CodeRepo. :Book/:Thesis kept
+# as :Paper to avoid re-labeling the already-ingested 4276 nodes.
+ITEM_TYPE_TO_LABELS: dict[str, tuple[str, str]] = {
+    # paper family — unchanged behavior
+    "journalArticle":     ("Source", "Paper"),
+    "preprint":           ("Source", "Paper"),
+    "conferencePaper":    ("Source", "Paper"),
+    "thesis":             ("Source", "Paper"),
+    "bookSection":        ("Source", "Paper"),
+    "book":               ("Source", "Paper"),
+    "report":             ("Source", "Paper"),
+    # T3 new
+    "webpage":            ("Source", "Webpage"),
+    "blogPost":           ("Source", "Webpage"),
+    "encyclopediaArticle": ("Source", "Webpage"),
+    "forumPost":          ("Source", "Webpage"),
+    "computerProgram":    ("Source", "CodeRepo"),
+    "software":           ("Source", "CodeRepo"),
+}
+
+
+def _label_hierarchy(item_type: str) -> tuple[str, str]:
+    """Return (``Source``, <sub_label>) for a Zotero itemType.
+
+    Unknown types (including accidentally routed ``attachment`` / ``note``
+    or any new itemType added to Zotero) → logged warning + returned as
+    ``('Source', 'Unknown')`` so the node is easy to find and fix, not
+    silently merged into ``:Paper``.
+    """
+    out = ITEM_TYPE_TO_LABELS.get(item_type)
+    if out is None:
+        logger.warning("unknown itemType %r → tagging :Source:Unknown", item_type)
+        return ("Source", "Unknown")
+    return out
+
+
+# Closed set for f-string label injection — every sub-label below must be
+# a valid Cypher identifier (letters only, no special chars). Guards against
+# accidental label expansion breaking Cypher.
+_ALLOWED_SUB_LABELS = frozenset({"Paper", "Webpage", "CodeRepo", "Unknown"})
+
+
 class Neo4jWriter:
     # T1 schema indexes — created once per process. Idempotent via
     # ``CREATE INDEX ... IF NOT EXISTS``; safe to re-run.
@@ -559,12 +606,17 @@ class Neo4jWriter:
         so both paths contribute a tag to ``r.kind_sources`` even when
         the edge already exists (``ON MATCH`` appends).
         """
+        # T3 fix: start from :Source (not :Paper) so Wikipedia / blog items
+        # that happen to carry a DOI in item.data.DOI ALSO get linked to
+        # the corresponding Paper node via SAME_WORK_AS. The DOI uniqueness
+        # invariant carries through — there's no concern that we'd
+        # accidentally link an unrelated Source.
         counts = {"doi_links": 0, "arxiv_links": 0}
         with self.driver.session() as s:
             # DOI-driven linking
             res = s.run(
                 """
-                MATCH (p:Source:Paper {id: $pid}) WHERE p.doi IS NOT NULL
+                MATCH (p:Source {id: $pid}) WHERE p.doi IS NOT NULL
                 WITH p
                 MATCH (other:Source {doi: p.doi}) WHERE other.id <> p.id
                 MERGE (p)-[r:SAME_WORK_AS]->(other)
@@ -585,7 +637,7 @@ class Neo4jWriter:
             # arxiv_id-driven linking (independent MERGE; ON MATCH appends tag)
             res = s.run(
                 """
-                MATCH (p:Source:Paper {id: $pid}) WHERE p.arxiv_id IS NOT NULL
+                MATCH (p:Source {id: $pid}) WHERE p.arxiv_id IS NOT NULL
                 WITH p
                 MATCH (other:Source {arxiv_id: p.arxiv_id}) WHERE other.id <> p.id
                 MERGE (p)-[r:SAME_WORK_AS]->(other)
@@ -611,18 +663,28 @@ class Neo4jWriter:
     ):
         doi = (ids or {}).get("doi")
         arxiv_id = (ids or {}).get("arxiv_id")
+        # T3: route to :Paper / :Webpage / :CodeRepo / :Unknown by itemType.
+        # Sub-label is from closed set ``_ALLOWED_SUB_LABELS``; f-string
+        # interpolation is injection-safe so long as the set stays closed.
+        _root, sub = _label_hierarchy(item_type)
+        if sub not in _ALLOWED_SUB_LABELS:
+            # Defensive: _label_hierarchy shouldn't produce anything outside
+            # the allowed set, but guard against future additions breaking
+            # Cypher. Degrade to Unknown.
+            logger.error("unexpected sub-label %r (allowed=%s); "
+                         "using :Unknown", sub, sorted(_ALLOWED_SUB_LABELS))
+            sub = "Unknown"
         with self.driver.session() as s:
-            # Source node (always Paper for now — book/thesis subtypes come later)
             s.run(
-                """MERGE (p:Source:Paper {id: $pid})
-                   SET p.title = $title,
-                       p.year = $year,
-                       p.tldr = $tldr,
-                       p.problem = $problem,
-                       p.item_type = $item_type,
-                       p.contribution_type = $ctype,
-                       p.doi = $doi,
-                       p.arxiv_id = $arxiv_id""",
+                f"""MERGE (p:Source:{sub} {{id: $pid}})
+                    SET p.title = $title,
+                        p.year = $year,
+                        p.tldr = $tldr,
+                        p.problem = $problem,
+                        p.item_type = $item_type,
+                        p.contribution_type = $ctype,
+                        p.doi = $doi,
+                        p.arxiv_id = $arxiv_id""",
                 pid=paper.paper_id, title=paper.title, year=paper.year,
                 tldr=paper.tldr, problem=paper.problem[:500],
                 item_type=item_type, ctype=paper.contribution_type,

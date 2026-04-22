@@ -460,6 +460,34 @@ VISION_TAIL_PROMPT = (
     "same JSON schema as for text-only extraction."
 )
 
+# T3: Zotero item types that trigger NON_PAPER_HINT. Kept here (not in
+# ingest.py's T3_NON_PAPER_TYPES) so callers can pass item_type_hint without
+# an ingest.py import, and so extractor's contract is self-contained.
+_NON_PAPER_ITEM_TYPES = frozenset({
+    "webpage", "blogPost", "computerProgram",
+    "encyclopediaArticle", "forumPost", "software",
+})
+
+
+# T3: appended to user_prompt when a non-paper item is being extracted. The
+# paper-centric schema (methods_used / references / venue etc.) maps poorly
+# to a webpage / GitHub README / forum post — this hint relaxes
+# expectations rather than changing the schema itself.
+NON_PAPER_HINT = (
+    "\n\nNOTE: This source is NOT a peer-reviewed academic paper. It is a "
+    "webpage, GitHub repository, blog post, encyclopedia article, or forum "
+    "post. Interpret the JSON schema loosely:\n"
+    "- Leave `references` empty unless the page explicitly lists DOIs or "
+    "cited papers.\n"
+    "- `venue` should be the website / blog / GitHub org (if applicable) "
+    "rather than a conference.\n"
+    "- Focus `concepts`, `methods_used`, and `methods_proposed` on whatever "
+    "the page actually describes (library features / tutorial topics / "
+    "forum Q&A context).\n"
+    "- `contribution_type` should be one of theory / method / system / "
+    "survey / dataset / tool as before — pick the closest fit."
+)
+
 
 def _call_llm_chain(
     providers: list[dict], user_prompt: str,
@@ -575,6 +603,7 @@ def extract_structured(
     paper_id: str,
     max_retries: int = 2,
     figures: list[dict] | None = None,
+    item_type_hint: str | None = None,
 ) -> tuple[ExtractedPaper | None, str | None]:
     """Run the LLM on the markdown and return ``(paper, provider_name)``.
 
@@ -582,6 +611,10 @@ def extract_structured(
     - ``figures=[{"bytes": b"...", ...}]`` → VLM_PROVIDER_CHAIN first; on
       *all-fail* (every VLM provider exhausts its fallback paths) falls back
       to the text chain (paper still ingests, just without figure context).
+    - ``item_type_hint`` (T3): if ``"webpage"`` / ``"blogPost"`` / ``"software"`` /
+      ``"computerProgram"`` / ``"encyclopediaArticle"`` / ``"forumPost"``,
+      ``NON_PAPER_HINT`` is appended to the user prompt so the LLM relaxes
+      the paper-centric schema expectations (empty references etc.).
 
     Returns ``(None, None)`` after logging when every chain + retry fails to
     produce valid JSON — better to skip than corrupt the graph. Callers use
@@ -589,6 +622,8 @@ def extract_structured(
     """
     truncated = _truncate(markdown, MAX_INPUT_TOKENS - 4000)
     user_msg = f"paper_id={paper_id}\ntitle={title}\n\n=== Markdown ===\n{truncated}"
+    if item_type_hint and item_type_hint in _NON_PAPER_ITEM_TYPES:
+        user_msg += NON_PAPER_HINT
     wants_vlm = bool(figures)
     last_err, last_raw = "unknown", ""
 

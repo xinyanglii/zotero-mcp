@@ -153,6 +153,85 @@ def _parse_paper_ids(item: dict) -> dict:
     return {"doi": doi, "arxiv_id": arxiv}
 
 
+# ======================================================================
+# Non-paper URL fetch helper (T3)
+# ======================================================================
+# Zotero ``webpage`` / ``blogPost`` / ``computerProgram`` / etc. items
+# carry ``item.data.url``. We fetch the URL with a browser User-Agent
+# (markitdown's default UA gets 403'd on Wikipedia / StackExchange) and
+# parse to markdown via markitdown's stream mode. Single timeout-capped
+# path so a stuck fetch can't hang the whole ingest batch.
+#
+# Zhihu and other SPA / cookie-walled sites fail → caller falls back to
+# ``_metadata_only_markdown``. v1 accepts the ~<10% metadata-only share;
+# Playwright / Tavily escalation is deferred to T5.
+T3_NON_PAPER_TYPES = frozenset({
+    "webpage", "blogPost", "computerProgram",
+    "encyclopediaArticle", "forumPost", "software",
+})
+T3_UA_BROWSER = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
+T3_FETCH_TIMEOUT = int(os.environ.get("T3_FETCH_TIMEOUT", "30"))
+T3_MD_ACCEPT_LEN = int(os.environ.get("T3_MD_ACCEPT_LEN", "500"))
+
+
+def fetch_markdown_via_markitdown(url: str) -> str:
+    """Fetch ``url`` with browser UA, parse HTML → markdown via markitdown.
+
+    Returns markdown string (possibly empty on any failure; caller should
+    fall back to metadata-only markdown). Single-path with a 30s hard
+    timeout cap — avoids markitdown's own ``requests`` layer hanging on
+    slow / SPA endpoints.
+    """
+    # Normalize: treat whitespace-only / None as empty (Finding #3). Avoids
+    # urllib.request.Request raising ValueError on malformed URLs, which
+    # isn't caught by the HTTPError/URLError/TimeoutError/OSError tuple
+    # below and would otherwise bubble up and crash the per-item ingest.
+    if not url or not isinstance(url, str):
+        return ""
+    url = url.strip()
+    if not url:
+        return ""
+    try:
+        import io as _io
+        from markitdown import MarkItDown, StreamInfo
+    except ImportError as e:
+        logger.warning("markitdown missing: %s — T3 URL fetch disabled", e)
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": T3_UA_BROWSER})
+    except ValueError as e:
+        logger.warning("T3 fetch bad url %r: %s", url, e)
+        return ""
+    try:
+        with urllib.request.urlopen(req, timeout=T3_FETCH_TIMEOUT) as r:
+            body = r.read()
+            ctype = r.headers.get("Content-Type", "")
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            TimeoutError, OSError) as e:
+        logger.warning("T3 fetch fail %s: %s", url, e)
+        return ""
+    ext = ".html" if "html" in ctype else ""
+    try:
+        r = MarkItDown().convert(
+            _io.BytesIO(body), stream_info=StreamInfo(extension=ext))
+        return r.text_content or ""
+    # Finding #2: markitdown's thrown types vary (ValueError for bad HTML,
+    # RuntimeError for converter issues, sometimes its own MarkItDownException).
+    # Narrow enough to surface real bugs in test runs, catch enough for real
+    # URLs with weird encodings.
+    except (ValueError, RuntimeError, OSError) as e:
+        logger.warning("T3 markitdown parse fail %s (%s): %s",
+                       url, type(e).__name__, e)
+        return ""
+    except Exception as e:   # noqa: BLE001 — last-resort to keep batch alive
+        logger.warning("T3 markitdown unexpected %s on %s: %s",
+                       type(e).__name__, url, e)
+        return ""
+
+
 def _build_caption_map(md: str) -> dict[str, str]:
     """Return ``{mineru_name → caption}`` for all image refs in ``md``.
 
@@ -277,10 +356,20 @@ def list_ingest_candidates(
     item_types: set[str] | None = None,
     limit: int | None = None,
 ) -> list[dict]:
-    """Yield top-level items eligible for ingest (not tagged skip/duplicate/orphan)."""
+    """Yield top-level items eligible for ingest (not tagged skip/duplicate/orphan).
+
+    T3 extends the default whitelist to cover non-academic sources
+    (``webpage``, ``blogPost``, ``computerProgram``, ``encyclopediaArticle``,
+    ``forumPost``) — these are routed to ``:Source:Webpage`` or
+    ``:Source:CodeRepo`` in Neo4j (see ``kg_store.ITEM_TYPE_TO_LABELS``).
+    """
     item_types = item_types or {
+        # paper family
         "journalArticle", "preprint", "conferencePaper",
         "thesis", "bookSection", "book", "report",
+        # T3 additions (Wiki §2.1 "webpage → markitdown fallback")
+        "webpage", "blogPost", "computerProgram",
+        "encyclopediaArticle", "forumPost",
     }
     out: list[dict] = []
     start = 0
@@ -540,14 +629,39 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
     images_raw: dict[str, bytes] = {}
 
     if pdf is None:
-        md = _metadata_only_markdown(item)
-        metadata_only = True
-        if len(md.strip()) < 120:
-            sql.record_failure(pid, "no_content",
-                               "no PDF and no abstract/metadata body")
-            stats["status"] = "skip_no_content"
-            return stats
-        stats["mode"] = "meta_only"
+        # T3: for non-paper types with a URL, try markitdown fetch before
+        # falling back to metadata-only. Papers still go straight to
+        # metadata-only (their URLs typically point at publisher paywalls /
+        # IEEE / ACM landing pages that don't parse usefully).
+        url = (item.get("url") or "").strip()
+        item_type = item.get("itemType", "")
+        fetched = ""
+        if url and item_type in T3_NON_PAPER_TYPES:
+            fetched = fetch_markdown_via_markitdown(url)
+        fetched_len = len(fetched.strip())
+        if fetched and fetched_len >= T3_MD_ACCEPT_LEN:
+            md = fetched
+            stats["mode"] = "url_fetch"
+            stats["fetch_status"] = "ok"
+            stats["fetched_len"] = fetched_len
+        else:
+            md = _metadata_only_markdown(item)
+            metadata_only = True
+            if fetched:
+                # fetch succeeded but too short → log why we fell through
+                logger.info("T3 %s fetched md len=%d < %d, using meta_only",
+                            pid, fetched_len, T3_MD_ACCEPT_LEN)
+                stats["fetch_status"] = "too_short"
+                stats["fetched_len"] = fetched_len
+            elif url and item_type in T3_NON_PAPER_TYPES:
+                stats["fetch_status"] = "fail"
+                stats["fetched_len"] = 0
+            if len(md.strip()) < 120:
+                sql.record_failure(pid, "no_content",
+                                   "no PDF and no abstract/metadata body")
+                stats["status"] = "skip_no_content"
+                return stats
+            stats["mode"] = "meta_only"
     else:
         tmp_pdf = work_tmp / f"{pid}.pdf"
         tmp_pdf.write_bytes(pdf)
@@ -587,6 +701,7 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
     paper, extract_provider = extract_structured(
         md, title=item.get("title", ""), paper_id=pid,
         figures=vlm_input or None,
+        item_type_hint=item.get("itemType"),
     )
     llm_secs = time.time() - t_llm
     if paper is None:
