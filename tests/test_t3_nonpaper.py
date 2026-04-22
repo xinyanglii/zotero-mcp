@@ -19,6 +19,7 @@ from zotero_mcp.kg_store import (
 from zotero_mcp.ingest import (
     T3_NON_PAPER_TYPES,
     fetch_markdown_via_markitdown,
+    fetch_snapshot_markdown,
 )
 from zotero_mcp.extractor import (
     NON_PAPER_HINT,
@@ -196,6 +197,102 @@ def test_non_paper_hint_not_prepended_on_paper(monkeypatch):
         item_type_hint="journalArticle",
     )
     assert NON_PAPER_HINT not in captured["user_msg"]
+
+
+# ---------------------------------------------------------------------------
+# fetch_snapshot_markdown (Tier 2 fallback)
+# ---------------------------------------------------------------------------
+def test_snapshot_no_children_returns_empty(monkeypatch):
+    """Items with no children (e.g. the 2 Zhihu items) → snapshot is ""."""
+    from zotero_mcp import ingest
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [])
+    assert fetch_snapshot_markdown("T3ITEM") == ""
+
+
+def test_snapshot_pdf_only_child_returns_empty(monkeypatch):
+    """Child is PDF (paper), not HTML snapshot → Tier 2 skips."""
+    from zotero_mcp import ingest
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT1", "data": {"itemType": "attachment",
+                                   "contentType": "application/pdf"}},
+    ])
+    assert fetch_snapshot_markdown("T3ITEM") == ""
+
+
+def test_snapshot_html_attachment_parsed(monkeypatch):
+    """HTML child attachment → WebDAV fetch → markitdown parse → md string."""
+    from zotero_mcp import ingest, webdav
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT2", "data": {"itemType": "attachment",
+                                   "contentType": "text/html"}},
+    ])
+    monkeypatch.setattr(webdav, "webdav_enabled", lambda: True)
+    html = b"<html><body><h1>Saved Snapshot</h1><p>Full body text.</p></body></html>"
+    monkeypatch.setattr(webdav, "fetch_attachment_bytes",
+                         lambda key, timeout=60: html)
+    md = fetch_snapshot_markdown("T3ITEM")
+    assert "Saved Snapshot" in md
+    assert "Full body text" in md
+
+
+def test_snapshot_webdav_disabled_falls_through_to_cloud(monkeypatch):
+    """WebDAV not configured → Tier 2 still tries Zotero Cloud."""
+    from zotero_mcp import ingest, webdav
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT3", "data": {"itemType": "attachment",
+                                   "contentType": "text/html"}},
+    ])
+    monkeypatch.setattr(webdav, "webdav_enabled", lambda: False)
+    cloud_html = b"<html><body><p>Cloud-saved content</p></body></html>"
+    monkeypatch.setattr(ingest, "_zotero_cloud_fetch",
+                         lambda key: cloud_html)
+    md = fetch_snapshot_markdown("T3ITEM")
+    assert "Cloud-saved content" in md
+
+
+def test_snapshot_webdav_empty_falls_through_to_cloud(monkeypatch):
+    """Common case: WebDAV returns 0-byte placeholder (Chrome Connector
+    snapshot only lives on Zotero Cloud). Tier 2 should try Cloud."""
+    from zotero_mcp import ingest, webdav
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT3B", "data": {"itemType": "attachment",
+                                   "contentType": "text/html"}},
+    ])
+    monkeypatch.setattr(webdav, "webdav_enabled", lambda: True)
+    monkeypatch.setattr(webdav, "fetch_attachment_bytes",
+                         lambda key, timeout=60: None)  # 0-byte zip → None
+    cloud_html = b"<html><h1>From Cloud</h1></html>"
+    monkeypatch.setattr(ingest, "_zotero_cloud_fetch",
+                         lambda key: cloud_html)
+    assert "From Cloud" in fetch_snapshot_markdown("T3ITEM")
+
+
+def test_snapshot_both_sources_fail_returns_empty(monkeypatch):
+    """WebDAV + Zotero Cloud both empty/fail → returns ""."""
+    from zotero_mcp import ingest, webdav
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT3C", "data": {"itemType": "attachment",
+                                   "contentType": "text/html"}},
+    ])
+    monkeypatch.setattr(webdav, "webdav_enabled", lambda: True)
+    monkeypatch.setattr(webdav, "fetch_attachment_bytes",
+                         lambda key, timeout=60: None)
+    monkeypatch.setattr(ingest, "_zotero_cloud_fetch", lambda key: None)
+    assert fetch_snapshot_markdown("T3ITEM") == ""
+
+
+def test_snapshot_webdav_fetch_error_returns_empty(monkeypatch):
+    """WebDAV outage / 503 → Tier 2 returns "", caller falls to Tier 3."""
+    from zotero_mcp import ingest, webdav
+    monkeypatch.setattr(ingest, "_z_get_json", lambda *a, **kw: [
+        {"key": "ATT4", "data": {"itemType": "attachment",
+                                   "contentType": "text/html"}},
+    ])
+    monkeypatch.setattr(webdav, "webdav_enabled", lambda: True)
+    def _raise(key, timeout=60):
+        raise webdav.WebDAVOutageError("503 persistent")
+    monkeypatch.setattr(webdav, "fetch_attachment_bytes", _raise)
+    assert fetch_snapshot_markdown("T3ITEM") == ""
 
 
 def test_non_paper_hint_not_prepended_when_hint_is_none(monkeypatch):

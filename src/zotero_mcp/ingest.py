@@ -177,6 +177,76 @@ T3_FETCH_TIMEOUT = int(os.environ.get("T3_FETCH_TIMEOUT", "30"))
 T3_MD_ACCEPT_LEN = int(os.environ.get("T3_MD_ACCEPT_LEN", "500"))
 
 
+def fetch_snapshot_markdown(item_key: str) -> str:
+    """T3 Tier 2: load a Zotero child HTML snapshot attachment and parse it.
+
+    Looks for a child attachment with ``contentType='text/html'`` (produced
+    by Zotero Connector's "Save Page with Snapshot" feature). If present,
+    downloads the archived HTML bytes via WebDAV and parses them with
+    markitdown — same output shape as ``fetch_markdown_via_markitdown``.
+
+    Preferred fallback order in ``ingest_one``:
+        live URL fetch → snapshot attachment → metadata-only
+
+    Returns "" if no snapshot exists or any step fails. Snapshot content may
+    be stale (saved long ago) — that's the tradeoff for getting past
+    login-walled sites (Zhihu etc.): user's logged-in session captured it,
+    we just replay it.
+    """
+    try:
+        children = _z_get_json(f"/items/{item_key}/children", {"format": "json"})
+    except Exception as e:
+        logger.debug("T3 snapshot: /children fetch fail %s: %s", item_key, e)
+        return ""
+    # Find the first HTML attachment (Zotero snapshots use contentType=text/html)
+    att = next(
+        (c for c in children
+         if c["data"].get("itemType") == "attachment"
+         and c["data"].get("contentType") == "text/html"),
+        None,
+    )
+    if not att:
+        return ""
+    att_key = att["key"]
+    html_bytes: bytes | None = None
+    # Source A: WebDAV (our own zotero-mcp ingest stores md/html here).
+    # Browser Zotero Connector snapshots may leave a 0-byte placeholder
+    # since Connector uploads to Zotero Cloud, not WebDAV — we treat
+    # missing or empty-zip WebDAV as "not there" and fall through to B.
+    try:
+        from zotero_mcp import webdav as _webdav
+        if _webdav.webdav_enabled():
+            html_bytes = _webdav.fetch_attachment_bytes(att_key)
+    except Exception as e:
+        logger.debug("T3 snapshot WebDAV fail %s (att %s): %s",
+                     item_key, att_key, e)
+    # Source B: Zotero Cloud (where browser Connector uploads by default)
+    if not html_bytes:
+        try:
+            html_bytes = _zotero_cloud_fetch(att_key)
+        except Exception as e:
+            logger.debug("T3 snapshot Zotero Cloud fail %s (att %s): %s",
+                         item_key, att_key, e)
+    if not html_bytes:
+        logger.debug("T3 snapshot: no bytes from WebDAV or Cloud for %s", item_key)
+        return ""
+    try:
+        import io as _io
+        from markitdown import MarkItDown, StreamInfo
+        r = MarkItDown().convert(
+            _io.BytesIO(html_bytes), stream_info=StreamInfo(extension=".html"))
+        md = r.text_content or ""
+        if md:
+            logger.info("T3 snapshot loaded for %s: md len=%d", item_key, len(md))
+        return md
+    except (ValueError, RuntimeError, OSError) as e:
+        logger.warning("T3 snapshot markitdown fail %s: %s", item_key, e)
+        return ""
+    except Exception as e:  # noqa: BLE001
+        logger.warning("T3 snapshot unexpected %s: %s", type(e).__name__, e)
+        return ""
+
+
 def fetch_markdown_via_markitdown(url: str) -> str:
     """Fetch ``url`` with browser UA, parse HTML → markdown via markitdown.
 
@@ -629,33 +699,53 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
     images_raw: dict[str, bytes] = {}
 
     if pdf is None:
-        # T3: for non-paper types with a URL, try markitdown fetch before
-        # falling back to metadata-only. Papers still go straight to
-        # metadata-only (their URLs typically point at publisher paywalls /
-        # IEEE / ACM landing pages that don't parse usefully).
+        # T3: for non-paper types, the fallback chain is:
+        #   Tier 1 — live URL fetch via markitdown (fresh content)
+        #   Tier 2 — Zotero Connector HTML snapshot (user-saved, possibly
+        #            logged-in session → catches Zhihu / paywalled pages,
+        #            but may be stale)
+        #   Tier 3 — metadata-only markdown (title + abstractNote)
+        #
+        # Paper types skip Tiers 1+2 and go straight to metadata (their URLs
+        # typically point at publisher paywalls that don't parse usefully).
         url = (item.get("url") or "").strip()
         item_type = item.get("itemType", "")
-        fetched = ""
-        if url and item_type in T3_NON_PAPER_TYPES:
-            fetched = fetch_markdown_via_markitdown(url)
-        fetched_len = len(fetched.strip())
-        if fetched and fetched_len >= T3_MD_ACCEPT_LEN:
-            md = fetched
-            stats["mode"] = "url_fetch"
-            stats["fetch_status"] = "ok"
-            stats["fetched_len"] = fetched_len
+        is_t3 = item_type in T3_NON_PAPER_TYPES
+        md_candidate = ""
+        md_source = None   # "url_fetch" | "snapshot" | None
+
+        if is_t3:
+            # Tier 1: live URL fetch
+            if url:
+                fetched = fetch_markdown_via_markitdown(url)
+                fetched_len = len(fetched.strip())
+                stats["fetched_url_len"] = fetched_len
+                if fetched and fetched_len >= T3_MD_ACCEPT_LEN:
+                    md_candidate = fetched
+                    md_source = "url_fetch"
+                else:
+                    stats["fetch_status"] = ("too_short" if fetched else
+                                              ("fail" if url else "no_url"))
+
+            # Tier 2: snapshot attachment (only when Tier 1 didn't produce
+            # usable content). Might be stale but at least gets past 403s.
+            if not md_candidate:
+                snap = fetch_snapshot_markdown(pid)
+                snap_len = len(snap.strip())
+                stats["snapshot_len"] = snap_len
+                if snap and snap_len >= T3_MD_ACCEPT_LEN:
+                    md_candidate = snap
+                    md_source = "snapshot"
+
+        if md_candidate:
+            md = md_candidate
+            stats["mode"] = md_source   # "url_fetch" or "snapshot"
+            if md_source == "url_fetch":
+                stats["fetch_status"] = "ok"
         else:
+            # Tier 3 fallback
             md = _metadata_only_markdown(item)
             metadata_only = True
-            if fetched:
-                # fetch succeeded but too short → log why we fell through
-                logger.info("T3 %s fetched md len=%d < %d, using meta_only",
-                            pid, fetched_len, T3_MD_ACCEPT_LEN)
-                stats["fetch_status"] = "too_short"
-                stats["fetched_len"] = fetched_len
-            elif url and item_type in T3_NON_PAPER_TYPES:
-                stats["fetch_status"] = "fail"
-                stats["fetched_len"] = 0
             if len(md.strip()) < 120:
                 sql.record_failure(pid, "no_content",
                                    "no PDF and no abstract/metadata body")
