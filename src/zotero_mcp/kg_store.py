@@ -452,9 +452,38 @@ class QdrantWriter:
 # Neo4jWriter — MERGE nodes + relations
 # ======================================================================
 class Neo4jWriter:
+    # T1 schema indexes — created once per process. Idempotent via
+    # ``CREATE INDEX ... IF NOT EXISTS``; safe to re-run.
+    #
+    # Rationale (see plans/zotero-kg-t1-spec.md §2.4):
+    #   source_doi / source_arxiv_id  — make SAME_WORK_AS scan do index seek
+    #     rather than scan-all-Source. In Neo4j 5 a range index on :Source
+    #     honors the label even when the node is multi-labelled
+    #     :Source:Paper / :Source:ExternalRef.
+    #   paper_id — drives the MATCH (:Paper {id:$pid}) entry point; we only
+    #     have 4276 Papers now but the cost is trivial and pays off for
+    #     backfill-script bulk ops.
+    _INDEXES_CYPHER = (
+        "CREATE INDEX source_doi      IF NOT EXISTS FOR (s:Source) ON (s.doi)",
+        "CREATE INDEX source_arxiv_id IF NOT EXISTS FOR (s:Source) ON (s.arxiv_id)",
+        "CREATE INDEX paper_id        IF NOT EXISTS FOR (p:Paper)  ON (p.id)",
+    )
+
     def __init__(self, uri: str, user: str, password: str):
         from neo4j import GraphDatabase
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        """Best-effort index creation. Neo4j sometimes 503s on DDL right
+        after container start; we log and move on rather than block ingest
+        startup. Backfill script can explicitly rerun via _ensure_indexes()."""
+        try:
+            with self.driver.session() as s:
+                for stmt in self._INDEXES_CYPHER:
+                    s.run(stmt).consume()
+        except Exception as e:
+            logger.warning("neo4j index ensure failed (will retry lazily): %s", e)
 
     def close(self):
         self.driver.close()
@@ -471,6 +500,7 @@ class Neo4jWriter:
         *,
         item_type: str,
         authors: list[dict] | None = None,
+        ids: dict | None = None,
     ):
         """MERGE Source + Method/Concept/Dataset/Author/Venue nodes and edges.
 
@@ -479,6 +509,13 @@ class Neo4jWriter:
         opens a fresh session so connection-pool eviction recovers
         gracefully. Neo4j's MERGE is idempotent so re-running the full
         block is safe.
+
+        ``ids``: optional ``{"doi": str|None, "arxiv_id": str|None}``. When
+        provided, the values are SET on the Paper node and a separate pass
+        (`_link_same_work_as`) MERGEs ``SAME_WORK_AS`` edges to any other
+        ``:Source`` sharing the same identifiers. Split off ``_write_paper_once``
+        so retry of the main node/rel writes doesn't re-scan the entire
+        identifier graph on every transient error.
         """
         import time as _t
         try:
@@ -491,7 +528,9 @@ class Neo4jWriter:
         delay = 1.0
         for attempt in range(1, 4):
             try:
-                return self._write_paper_once(paper, item_type=item_type, authors=authors)
+                self._write_paper_once(
+                    paper, item_type=item_type, authors=authors, ids=ids)
+                break
             except _retry_excs as e:
                 if attempt >= 3:
                     raise
@@ -500,13 +539,78 @@ class Neo4jWriter:
                 _t.sleep(delay)
                 delay = min(delay * 2, 15)
 
+        # Link SAME_WORK_AS after main write succeeded. Standalone so the
+        # retry loop above doesn't re-run this scan on every transient fail.
+        if ids and (ids.get("doi") or ids.get("arxiv_id")):
+            try:
+                self._link_same_work_as(paper.paper_id)
+            except Exception as e:
+                # don't fail the whole paper ingest over a SAME_WORK_AS scan —
+                # record but let caller continue
+                logger.warning("SAME_WORK_AS link for %s failed: %s",
+                               paper.paper_id, e)
+
+    def _link_same_work_as(self, paper_id: str) -> dict:
+        """Scan for existing Sources sharing this paper's DOI / arxiv_id and
+        MERGE ``SAME_WORK_AS`` edges. Returns counts per kind.
+
+        Safe to call standalone from the backfill script (T1-b) after bulk
+        identifier SET. Uses two separate MERGE passes (DOI then arxiv_id)
+        so both paths contribute a tag to ``r.kind_sources`` even when
+        the edge already exists (``ON MATCH`` appends).
+        """
+        counts = {"doi_links": 0, "arxiv_links": 0}
+        with self.driver.session() as s:
+            # DOI-driven linking
+            res = s.run(
+                """
+                MATCH (p:Source:Paper {id: $pid}) WHERE p.doi IS NOT NULL
+                WITH p
+                MATCH (other:Source {doi: p.doi}) WHERE other.id <> p.id
+                MERGE (p)-[r:SAME_WORK_AS]->(other)
+                  ON CREATE SET r.kind_sources = ['doi'],
+                                r.kind = CASE
+                                  WHEN 'ExternalRef' IN labels(other) THEN 'preprint-published-ref'
+                                  ELSE 'preprint-published'
+                                END,
+                                r.created_at = timestamp()
+                  ON MATCH  SET r.kind_sources = apoc.coll.toSet(
+                                  coalesce(r.kind_sources, []) + ['doi'])
+                RETURN count(r) AS n
+                """,
+                pid=paper_id,
+            )
+            counts["doi_links"] = res.single()["n"]
+
+            # arxiv_id-driven linking (independent MERGE; ON MATCH appends tag)
+            res = s.run(
+                """
+                MATCH (p:Source:Paper {id: $pid}) WHERE p.arxiv_id IS NOT NULL
+                WITH p
+                MATCH (other:Source {arxiv_id: p.arxiv_id}) WHERE other.id <> p.id
+                MERGE (p)-[r:SAME_WORK_AS]->(other)
+                  ON CREATE SET r.kind_sources = ['arxiv'],
+                                r.kind = 'arxiv-alias',
+                                r.created_at = timestamp()
+                  ON MATCH  SET r.kind_sources = apoc.coll.toSet(
+                                  coalesce(r.kind_sources, []) + ['arxiv'])
+                RETURN count(r) AS n
+                """,
+                pid=paper_id,
+            )
+            counts["arxiv_links"] = res.single()["n"]
+        return counts
+
     def _write_paper_once(
         self,
         paper: ExtractedPaper,
         *,
         item_type: str,
         authors: list[dict] | None = None,
+        ids: dict | None = None,
     ):
+        doi = (ids or {}).get("doi")
+        arxiv_id = (ids or {}).get("arxiv_id")
         with self.driver.session() as s:
             # Source node (always Paper for now — book/thesis subtypes come later)
             s.run(
@@ -516,10 +620,13 @@ class Neo4jWriter:
                        p.tldr = $tldr,
                        p.problem = $problem,
                        p.item_type = $item_type,
-                       p.contribution_type = $ctype""",
+                       p.contribution_type = $ctype,
+                       p.doi = $doi,
+                       p.arxiv_id = $arxiv_id""",
                 pid=paper.paper_id, title=paper.title, year=paper.year,
                 tldr=paper.tldr, problem=paper.problem[:500],
                 item_type=item_type, ctype=paper.contribution_type,
+                doi=doi, arxiv_id=arxiv_id,
             )
             # venue
             if paper.venue:

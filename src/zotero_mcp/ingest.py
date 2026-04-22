@@ -72,6 +72,87 @@ FIG_SIZE_LIMIT = 10 * 1024 * 1024  # 10MB → trigger compression per spec §4
 WEBDAV_FIG_CB_LIMIT = int(os.environ.get("INGEST_FIG_CB_LIMIT", "3"))
 
 
+# ======================================================================
+# Stable identifier helpers (T1)
+# ======================================================================
+# DOI RFC 3986 path-like; accept URL + prefix variants + any case. Neo4j
+# comparisons are case-sensitive, so normalize to lowercase on write.
+_DOI_URL_PREFIXES = (
+    "https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+    "http://dx.doi.org/", "doi:", "DOI:",
+)
+_ARXIV_RE = re.compile(
+    r"\barxiv:\s*(?P<id>\d{4}\.\d{4,5})(?P<v>v\d+)?\b",
+    re.IGNORECASE,
+)
+_ARXIV_ALIAS_DOI_RE = re.compile(
+    r"10\.48550/arxiv\.(?P<id>\d{4}\.\d{4,5})",
+    re.IGNORECASE,
+)
+# arxiv_id alone is allowed in extra field too — e.g. when user manually
+# typed just the id without "arXiv:" prefix
+_ARXIV_BARE_RE = re.compile(r"^(?P<id>\d{4}\.\d{4,5})$")
+
+
+def normalize_doi(raw) -> str | None:
+    """Return a lowercased canonical DOI (``10.<prefix>/<suffix>``) or None."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    for pref in _DOI_URL_PREFIXES:
+        if s.lower().startswith(pref.lower()):
+            s = s[len(pref):]
+            break
+    s = s.strip().lower()
+    if not s.startswith("10.") or "/" not in s:
+        return None
+    return s
+
+
+def normalize_arxiv(raw) -> str | None:
+    """Return bare ``YYMM.NNNNN`` arXiv id (no version suffix) or None.
+
+    Accepts ``arXiv:2501.18799 [eess]`` / ``arXiv:2501.18799v2`` /
+    ``10.48550/arXiv.2501.18799`` / plain ``2501.18799``.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    m = _ARXIV_ALIAS_DOI_RE.search(s)
+    if m:
+        return m.group("id")
+    m = _ARXIV_RE.search(s)
+    if m:
+        return m.group("id")
+    m = _ARXIV_BARE_RE.match(s)
+    if m:
+        return m.group("id")
+    return None
+
+
+def _parse_paper_ids(item: dict) -> dict:
+    """Extract ``{doi, arxiv_id}`` from a Zotero item.data dict.
+
+    Both values are optional; missing ones are ``None``. When the Zotero
+    ``DOI`` field itself is a ``10.48550/arXiv.*`` alias, the bare arxiv id
+    is ALSO populated — downstream SAME_WORK_AS scans will match preprint
+    and published versions regardless of which attribute Zotero recorded.
+    """
+    doi = normalize_doi(item.get("DOI", ""))
+    # arxiv from extra is common; fall back to scanning DOI if it's an alias
+    arxiv = normalize_arxiv(item.get("extra", ""))
+    if not arxiv and doi:
+        # doi may be an arxiv alias → mirror into arxiv_id
+        m = _ARXIV_ALIAS_DOI_RE.search(doi)
+        if m:
+            arxiv = m.group("id")
+    return {"doi": doi, "arxiv_id": arxiv}
+
+
 def _build_caption_map(md: str) -> dict[str, str]:
     """Return ``{mineru_name → caption}`` for all image refs in ``md``.
 
@@ -547,9 +628,13 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         logger.warning("qdrant upsert failed for %s: %s", pid, e)
 
     # Step 8 — Neo4j
+    paper_ids = _parse_paper_ids(item)
     try:
         ne.write_paper(paper, item_type=item["itemType"],
-                       authors=item.get("creators", []))
+                       authors=item.get("creators", []),
+                       ids=paper_ids)
+        if paper_ids["doi"] or paper_ids["arxiv_id"]:
+            stats["ids"] = paper_ids
     except Exception as e:
         sql.record_failure(pid, "neo4j", repr(e)[:400])
         logger.warning("neo4j write failed for %s: %s", pid, e)
