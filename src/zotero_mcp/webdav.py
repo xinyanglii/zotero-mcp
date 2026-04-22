@@ -58,18 +58,67 @@ def _auth_header() -> str:
     return "Basic " + base64.b64encode(f"{user}:{passwd}".encode()).decode()
 
 
+class WebDAVOutageError(Exception):
+    """Raised when WebDAV is persistently unavailable (403/429/5xx) after
+    all retries. Callers that loop over many papers should treat this as a
+    signal to pause rather than crash individual items."""
+
+
+def _retry_urlopen(req, timeout: int, max_attempts: int = 4):
+    """urlopen wrapper with exponential backoff on 429/5xx and Jianguoyun's
+    soft-throttle 403. 404 is surfaced unchanged. Final failure raises
+    WebDAVOutageError so outer loops can circuit-break.
+
+    Defaults: 4 attempts with 5/10/20/40s backoff (~75s total). 503 is
+    usually a Jianguoyun backend flap, not account throttle — hammering
+    with more retries just wastes time. Circuit-breaker in ingest.py
+    catches persistent outage and pauses the whole pipeline."""
+    delay = 5.0
+    last_err: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise
+            if e.code in (403, 429) or 500 <= e.code < 600:
+                last_err = e
+                ra_raw = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    sleep_s = int(ra_raw) if ra_raw else delay
+                except ValueError:
+                    sleep_s = delay
+                sleep_s = min(sleep_s, 40)
+                logger.warning("WebDAV %d on attempt %d/%d — sleeping %.1fs",
+                               e.code, attempt, max_attempts, sleep_s)
+                time.sleep(sleep_s)
+                delay = min(delay * 2, 40)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            logger.warning("WebDAV transport err on attempt %d/%d (%s) — sleeping %.1fs",
+                           attempt, max_attempts, type(e).__name__, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 40)
+    raise WebDAVOutageError(
+        f"WebDAV unavailable after {max_attempts} attempts: {last_err!r}")
+
+
 # ---------------------------------------------------------------------------
 # read
 # ---------------------------------------------------------------------------
 def fetch_attachment_bytes(attachment_key: str, timeout: int = 60) -> bytes | None:
     """Download ``<key>.zip`` from WebDAV and return the inner file's bytes.
 
-    Returns ``None`` on 404 / missing / bad zip.
+    Returns ``None`` on 404 / missing / bad zip. Raises ``WebDAVOutageError``
+    on persistent 403/429/5xx so callers can pause rather than mis-mark
+    the paper as permanently failed.
     """
     url = f"{_webdav_root()}/{attachment_key}.zip"
     req = urllib.request.Request(url, headers={"Authorization": _auth_header()})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _retry_urlopen(req, timeout=timeout) as r:
             raw = r.read()
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -139,7 +188,7 @@ def upload_attachment_bytes(
                 f"{root}/{attachment_key}{suffix}",
                 data=body, method="PUT", headers=headers,
             )
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _retry_urlopen(req, timeout=timeout) as r:
                 r.read()
             uploaded.append(suffix)
     except Exception:
@@ -157,6 +206,108 @@ def upload_attachment_bytes(
                              attachment_key, suffix, cleanup_err)
         raise
     return md5_hex, mtime_ms
+
+
+# ---------------------------------------------------------------------------
+# Figures — independent WebDAV tree, NOT routed through Zotero attachments.
+# Path layout:
+#     <figures_root>/<paper_id>/<mineru_name>.jpg
+# ``figures_root`` defaults to ``<zotero_webdav_url sibling>/zotero-kg-figures``
+# (e.g. Jianguoyun ``/dav/zotero-kg-figures``). Override via env
+# ``ZOTERO_KG_FIGURES_URL``. MKCOL on parent + per-paper dir is idempotent
+# (201 or 405 both OK). PUT retries via ``_retry_urlopen``.
+# ---------------------------------------------------------------------------
+def _figures_root() -> str:
+    override = os.environ.get("ZOTERO_KG_FIGURES_URL", "").rstrip("/")
+    if override:
+        return override
+    # Sibling of Zotero's WebDAV root. For Jianguoyun this resolves to
+    # https://dav.jianguoyun.com/dav/zotero-kg-figures (tested via MKCOL 201).
+    zotero_root = _webdav_root()
+    parent, _, _ = zotero_root.rpartition("/")
+    if not parent:
+        raise RuntimeError(
+            "cannot derive figures root from ZOTERO_WEBDAV_URL="
+            f"{zotero_root!r} — set ZOTERO_KG_FIGURES_URL explicitly")
+    return f"{parent}/zotero-kg-figures"
+
+
+_figures_root_ensured = False
+
+
+def _mkcol(url: str, *, timeout: int = 20) -> None:
+    """Idempotent MKCOL — 201 Created / 405 Already Exists both OK; raise on
+    other errors. Does NOT use ``_retry_urlopen`` because MKCOL semantics are
+    different: most errors here mean a permissions / path problem, not a
+    transient outage worth waiting on."""
+    headers = {"Authorization": _auth_header()}
+    req = urllib.request.Request(url, method="MKCOL", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 405:
+            return  # already exists
+        raise
+
+
+def _ensure_figures_root() -> str:
+    """Lazy one-time MKCOL on the figures root. Returns the root URL."""
+    global _figures_root_ensured
+    root = _figures_root()
+    if not _figures_root_ensured:
+        _mkcol(root)
+        _figures_root_ensured = True
+    return root
+
+
+def put_figure(
+    paper_id: str, mineru_name: str, img_bytes: bytes,
+    *,
+    content_type: str = "image/jpeg",
+    timeout: int = 60,
+) -> str:
+    """PUT one figure into the independent KG figures tree.
+
+    Returns the WebDAV path (relative to figures root) on success. Raises
+    ``WebDAVOutageError`` after retries exhausted. Caller decides whether to
+    record the failure or let the stage fail.
+
+    - Idempotent: re-running overwrites the same path (content-addressed).
+    - Ensures ``<figures_root>`` + ``<figures_root>/<paper_id>`` exist
+      (MKCOL once per process for the root, once per paper for its subdir).
+    """
+    root = _ensure_figures_root()
+    paper_dir = f"{root}/{paper_id}"
+    _mkcol(paper_dir)  # cheap; Jianguoyun returns 405 if it already exists
+    rel_path = f"{paper_id}/{mineru_name}"
+    url = f"{root}/{rel_path}"
+    headers = {
+        "Authorization": _auth_header(),
+        "Content-Type": content_type,
+        "Content-Length": str(len(img_bytes)),
+    }
+    req = urllib.request.Request(url, data=img_bytes, method="PUT", headers=headers)
+    with _retry_urlopen(req, timeout=timeout) as r:
+        r.read()
+    return rel_path
+
+
+def delete_figure(paper_id: str, mineru_name: str, *, timeout: int = 30) -> None:
+    """Best-effort DELETE of a single figure — used by tests and by a
+    potential ``zkg.py dedupe-figures`` tool. 404 is swallowed (nothing to
+    delete is not an error)."""
+    root = _figures_root()
+    url = f"{root}/{paper_id}/{mineru_name}"
+    req = urllib.request.Request(
+        url, method="DELETE", headers={"Authorization": _auth_header()})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return
+        raise
 
 
 # ---------------------------------------------------------------------------

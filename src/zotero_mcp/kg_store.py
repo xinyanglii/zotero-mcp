@@ -55,6 +55,26 @@ class SQLiteStore:
       ts REAL
     );
     CREATE INDEX IF NOT EXISTS idx_failures_paper ON failures(paper_id);
+    CREATE TABLE IF NOT EXISTS figures (
+      paper_id     TEXT    NOT NULL,
+      figure_idx   INTEGER NOT NULL,
+      mineru_name  TEXT    NOT NULL,
+      content_sha  TEXT    NOT NULL,
+      caption      TEXT,
+      bytes_len    INTEGER NOT NULL,
+      width        INTEGER,
+      height       INTEGER,
+      mime         TEXT    DEFAULT 'image/jpeg',
+      webdav_path  TEXT,
+      downscaled   INTEGER NOT NULL DEFAULT 0,
+      created_at   REAL    NOT NULL,
+      PRIMARY KEY (paper_id, figure_idx),
+      UNIQUE (paper_id, mineru_name),
+      FOREIGN KEY (paper_id) REFERENCES papers(paper_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_figures_content_sha ON figures(content_sha);
+    CREATE INDEX IF NOT EXISTS idx_figures_pending_upload
+      ON figures(paper_id) WHERE webdav_path IS NULL;
     """
 
     def __init__(self, db_path: str | Path):
@@ -64,8 +84,17 @@ class SQLiteStore:
         # connection; writes serialized via self._lock, so we stay consistent.
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.executescript(self.SCHEMA)
+        # Idempotent: add columns introduced after initial schema
+        self._ensure_column("papers", "extract_provider", "TEXT")
         self.conn.commit()
         self._lock = threading.Lock()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        """ALTER TABLE ADD COLUMN if missing (no-op otherwise). SQLite < 3.35
+        lacks IF NOT EXISTS for ADD COLUMN, so guard with pragma_table_info."""
+        cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self):
         with self._lock:
@@ -108,11 +137,107 @@ class SQLiteStore:
             )
             self.conn.commit()
 
+    def save_paper_with_figures(
+        self,
+        paper: ExtractedPaper,
+        *,
+        item_type: str,
+        md_text: str,
+        figures: list[dict],
+        extract_provider: str,
+        mineru_secs: float = 0.0,
+        llm_secs: float = 0.0,
+    ) -> None:
+        """Atomic write: figures + papers in one transaction.
+
+        ``figures`` entries carry: mineru_name, content_sha, caption, bytes_len,
+        width, height, mime, webdav_path (may be None if WebDAV upload skipped
+        on oversize after recompression), downscaled.
+
+        If anything raises, the ``with self.conn`` block rolls back — no half-
+        written state. This is the ONLY write path T0's ingest should use when
+        figures are being captured; ``save_paper`` stays for legacy / figure-
+        less flows.
+        """
+        now = time.time()
+        with self._lock:
+            with self.conn:  # auto-commit on success, rollback on exception
+                # Replace any prior figures for this paper (retry-safe).
+                self.conn.execute(
+                    "DELETE FROM figures WHERE paper_id=?", (paper.paper_id,))
+                for i, f in enumerate(figures):
+                    self.conn.execute(
+                        """INSERT INTO figures
+                           (paper_id, figure_idx, mineru_name, content_sha,
+                            caption, bytes_len, width, height, mime,
+                            webdav_path, downscaled, created_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            paper.paper_id, i,
+                            f["mineru_name"], f["content_sha"],
+                            f.get("caption"), f["bytes_len"],
+                            f.get("width"), f.get("height"),
+                            f.get("mime", "image/jpeg"),
+                            f.get("webdav_path"),
+                            1 if f.get("downscaled") else 0,
+                            now,
+                        ),
+                    )
+                self.conn.execute(
+                    """INSERT OR REPLACE INTO papers
+                       (paper_id, item_type, title, year, md_chars, md_text,
+                        extracted_json, ingested_at, mineru_secs, llm_secs,
+                        llm_input_tokens, llm_output_tokens, extract_provider)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        paper.paper_id, item_type, paper.title, paper.year,
+                        len(md_text), md_text, paper.model_dump_json(),
+                        now, mineru_secs, llm_secs, 0, 0,
+                        extract_provider,
+                    ),
+                )
+
+    def pending_webdav_figures(self, paper_id: str | None = None) -> list[dict]:
+        """Return figures missing WebDAV upload (for later backfill)."""
+        sql = ("SELECT paper_id, figure_idx, mineru_name FROM figures "
+               "WHERE webdav_path IS NULL")
+        params: tuple = ()
+        if paper_id is not None:
+            sql += " AND paper_id=?"
+            params = (paper_id,)
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [{"paper_id": r[0], "figure_idx": r[1], "mineru_name": r[2]}
+                for r in rows]
+
+    def mark_figure_uploaded(self, paper_id: str, mineru_name: str,
+                              webdav_path: str) -> None:
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE figures SET webdav_path=? "
+                    "WHERE paper_id=? AND mineru_name=?",
+                    (webdav_path, paper_id, mineru_name),
+                )
+
 
 # ======================================================================
 # Chunking + embedding helpers
 # ======================================================================
 _H2_SPLIT = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+
+# Public — Match MinerU figure refs: ``![](images/<64-hex>.<ext>)``.
+# Shared source of truth for both QdrantWriter.upsert_paper (chunks
+# ``payload.figure_refs``) and ingest._build_figures (caption capture).
+# ``mn`` group captures the **full filename including extension** — this
+# is what SQLite ``figures.mineru_name`` stores and what the WebDAV path
+# appends under ``<figures_root>/<paper_id>/``. Keeping the extension
+# avoids guessing MIME downstream and lets us support mixed .jpg/.png.
+IMG_REF_RE = re.compile(
+    r'!\[[^\]]*\]\(images/(?P<mn>[a-f0-9]{64}\.\w{2,4})\)'
+)
+# Legacy alias retained for readability in QdrantWriter below.
+_CHUNK_IMG_REF_RE = IMG_REF_RE
 
 
 def section_chunks(markdown: str, *, max_chars: int = 6000) -> list[dict[str, Any]]:
@@ -234,7 +359,15 @@ class QdrantWriter:
         item_type: str,
         markdown: str,
     ) -> int:
-        """Chunk markdown, embed (dense + sparse), upsert to Qdrant. Returns chunk count."""
+        """Chunk markdown, embed (dense + sparse), upsert to Qdrant. Returns chunk count.
+
+        Each chunk's payload carries a ``figure_refs`` list of MinerU
+        filenames (``<64hex>.jpg``) that appear as ``![](images/<mn>)``
+        inside the chunk text, so multimodal retrieval can cross-join to
+        SQLite ``figures`` / WebDAV ``/dav/zotero-kg-figures/``. Empty list
+        when no figure refs present — caller reads with
+        ``payload.get("figure_refs", [])`` for old-chunk compatibility.
+        """
         chunks = section_chunks(markdown)
         if not chunks:
             return 0
@@ -248,6 +381,15 @@ class QdrantWriter:
                 uuid.NAMESPACE_URL,
                 f"{paper.paper_id}#{c['chunk_idx']}",
             ))
+            # Collect MinerU figure names referenced in this chunk. dedup
+            # but preserve order for downstream consumers.
+            seen: set[str] = set()
+            figure_refs: list[str] = []
+            for m in _CHUNK_IMG_REF_RE.finditer(c["text"]):
+                name = m.group("mn")
+                if name not in seen:
+                    seen.add(name)
+                    figure_refs.append(name)
             points.append(dict(
                 id=pid,
                 vector={
@@ -265,6 +407,7 @@ class QdrantWriter:
                     "section_title": c["section_title"],
                     "chunk_idx": c["chunk_idx"],
                     "text": c["text"],
+                    "figure_refs": figure_refs,
                 },
             ))
         # Raw HTTP upsert in batches of 50 with wait=false. qdrant-client 1.12
@@ -329,7 +472,41 @@ class Neo4jWriter:
         item_type: str,
         authors: list[dict] | None = None,
     ):
-        """MERGE Source + Method/Concept/Dataset/Author/Venue nodes and edges."""
+        """MERGE Source + Method/Concept/Dataset/Author/Venue nodes and edges.
+
+        Retries on neo4j transient errors (ServiceUnavailable /
+        SessionExpired / TransientError) with exp backoff. Each retry
+        opens a fresh session so connection-pool eviction recovers
+        gracefully. Neo4j's MERGE is idempotent so re-running the full
+        block is safe.
+        """
+        import time as _t
+        try:
+            from neo4j.exceptions import (
+                ServiceUnavailable, SessionExpired, TransientError)
+            _retry_excs = (ServiceUnavailable, SessionExpired, TransientError)
+        except ImportError:
+            _retry_excs = ()
+
+        delay = 1.0
+        for attempt in range(1, 4):
+            try:
+                return self._write_paper_once(paper, item_type=item_type, authors=authors)
+            except _retry_excs as e:
+                if attempt >= 3:
+                    raise
+                logger.warning("neo4j write_paper attempt %d/3 transient (%s), sleep %.1fs",
+                               attempt, type(e).__name__, delay)
+                _t.sleep(delay)
+                delay = min(delay * 2, 15)
+
+    def _write_paper_once(
+        self,
+        paper: ExtractedPaper,
+        *,
+        item_type: str,
+        authors: list[dict] | None = None,
+    ):
         with self.driver.session() as s:
             # Source node (always Paper for now — book/thesis subtypes come later)
             s.run(

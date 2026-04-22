@@ -94,7 +94,56 @@ def convert_pdf_mineru_api(
     lang: str = "ch",
     timeout: int = 600,
 ) -> str:
-    """Convert via a running mineru-api server. Much faster for batch work."""
+    """Convert via a running mineru-api server. Much faster for batch work.
+
+    Legacy md-only entry — stays for backward compatibility with callers that
+    don't care about images. For the image-aware path, see
+    ``convert_pdf_mineru_api_with_images``.
+    """
+    md, _imgs = _call_mineru_api(
+        pdf_path, api_url=api_url, backend=backend, lang=lang, timeout=timeout,
+        return_images=False,
+    )
+    return md
+
+
+def convert_pdf_mineru_api_with_images(
+    pdf_path: str | Path,
+    *,
+    api_url: str | None = None,
+    backend: str = "pipeline",
+    lang: str = "ch",
+    timeout: int = 600,
+) -> tuple[str, dict[str, bytes]]:
+    """Convert + return images dict.
+
+    Returns ``(markdown, images)`` where ``images`` maps ``"<mineru_name>.jpg"``
+    (matching the ``![](images/<mineru_name>.jpg)`` refs embedded in markdown)
+    to raw image bytes (already base64-decoded from the API's data URIs).
+    """
+    return _call_mineru_api(
+        pdf_path, api_url=api_url, backend=backend, lang=lang, timeout=timeout,
+        return_images=True,
+    )
+
+
+def _call_mineru_api(
+    pdf_path: str | Path,
+    *,
+    api_url: str | None,
+    backend: str,
+    lang: str,
+    timeout: int,
+    return_images: bool,
+) -> tuple[str, dict[str, bytes]]:
+    """Shared helper — POSTs to /file_parse and decodes response.
+
+    When ``return_images=False`` the second tuple element is an empty dict.
+    When ``return_images=True`` it is ``{"<mineru_name>.jpg": raw_bytes}``.
+    Data URIs of the form ``data:image/<mime>;base64,<b64>`` are decoded into
+    raw bytes here so the caller doesn't have to string-parse.
+    """
+    import base64
     api_url = (api_url or os.environ["MINERU_API_URL"]).rstrip("/")
     pdf = Path(pdf_path).expanduser().resolve()
     if not pdf.is_file():
@@ -108,7 +157,7 @@ def convert_pdf_mineru_api(
             "lang_list": lang,       # mineru-api accepts a single string
             "return_md": "true",
             "return_middle_json": "false",
-            "return_images": "false",
+            "return_images": "true" if return_images else "false",
             "response_format_zip": "false",
         },
         files={"files": (pdf.name, pdf_bytes, "application/pdf")},
@@ -126,14 +175,39 @@ def convert_pdf_mineru_api(
 
     # The response wraps results per filename; pick the first md we find.
     results = data.get("results") or {}
+    md = ""
+    images_raw: dict[str, str] = {}
     for _fname, entry in results.items():
         md = entry.get("md_content") or entry.get("markdown") or entry.get("md") or ""
         if md:
-            return md
-    # some versions nest differently
-    if isinstance(data.get("md_content"), str):
-        return data["md_content"]
-    raise RuntimeError(f"mineru-api returned no markdown. Payload: {str(data)[:500]}")
+            if return_images:
+                images_raw = entry.get("images") or {}
+            break
+    if not md and isinstance(data.get("md_content"), str):
+        # some versions nest differently
+        md = data["md_content"]
+    if not md:
+        raise RuntimeError(f"mineru-api returned no markdown. Payload: {str(data)[:500]}")
+
+    # Decode data URIs → raw bytes. MinerU's format is
+    # ``data:image/<mime>;base64,<b64>``. We strip the header and b64decode.
+    images: dict[str, bytes] = {}
+    for name, data_uri in images_raw.items():
+        if not isinstance(data_uri, str):
+            logger.warning("mineru image %s not a string (type=%s), skipping",
+                           name, type(data_uri).__name__)
+            continue
+        _, _, payload = data_uri.partition(",")
+        if not payload:
+            logger.warning("mineru image %s has no base64 payload, skipping", name)
+            continue
+        try:
+            images[name] = base64.b64decode(payload)
+        except Exception as e:
+            logger.warning("mineru image %s base64 decode failed: %s", name, e)
+            continue
+
+    return md, images
 
 
 def convert_pdf_mineru(
@@ -149,11 +223,39 @@ def convert_pdf_mineru(
     CLI keeps the same defaults (pipeline backend; auto parse method; Chinese
     language hint works for mixed zh/en papers).
     """
+    md, _imgs = convert_pdf_mineru_with_images(
+        pdf_path, backend=backend, method=method, lang=lang, timeout=timeout,
+        want_images=False,
+    )
+    return md
+
+
+def convert_pdf_mineru_with_images(
+    pdf_path: str | Path,
+    *,
+    backend: str = "pipeline",
+    method: str = "auto",
+    lang: str = "ch",
+    timeout: int = 600,
+    want_images: bool = True,
+) -> tuple[str, dict[str, bytes]]:
+    """Convert + optionally return images.
+
+    API mode is preferred; on failure falls back to CLI. When ``want_images``
+    is False the returned images dict is empty (parity with legacy md-only
+    callers). The CLI fallback scans ``<out_dir>/.../images/*.jpg`` within the
+    ``TemporaryDirectory`` context so bytes are read out before the dir is
+    auto-deleted on context exit.
+    """
     if os.environ.get("MINERU_API_URL"):
         try:
+            if want_images:
+                return convert_pdf_mineru_api_with_images(
+                    pdf_path, backend=backend, lang=lang, timeout=timeout,
+                )
             return convert_pdf_mineru_api(
                 pdf_path, backend=backend, lang=lang, timeout=timeout,
-            )
+            ), {}
         except Exception as e:
             logger.warning("mineru-api failed, falling back to CLI: %s", e)
 
@@ -181,4 +283,12 @@ def convert_pdf_mineru(
                 f"mineru produced no markdown under {out_dir}. "
                 f"Stdout tail: {result.stdout[-500:]}"
             )
-        return md_path.read_text(encoding="utf-8", errors="replace")
+        md = md_path.read_text(encoding="utf-8", errors="replace")
+        images: dict[str, bytes] = {}
+        if want_images:
+            # CLI lays out `<out_dir>/.../images/*.jpg`. Read bytes out before
+            # TemporaryDirectory context exits and nukes everything.
+            for img_path in out_dir.rglob("images/*"):
+                if img_path.is_file():
+                    images[img_path.name] = img_path.read_bytes()
+        return md, images

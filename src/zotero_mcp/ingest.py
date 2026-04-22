@@ -44,10 +44,130 @@ except ImportError:
     pass
 
 from .extractor import extract_structured
-from .kg_store import make_writers
-from .parser_factory import convert_to_markdown_smart
+from .kg_store import IMG_REF_RE, make_writers
+from .parser_factory import convert_to_markdown_smart_with_images
 
 logger = logging.getLogger("zotero_mcp.ingest")
+
+# ======================================================================
+# Figure handling helpers (T0)
+# ======================================================================
+# MinerU writes md refs like ``![](images/<64-hex>.jpg)`` where the 64-hex
+# is its internal content-addressed filename. We reuse filename+extension
+# as ``mineru_name`` (same form as appears in md refs + WebDAV path). The
+# ref regex itself is shared from ``kg_store.IMG_REF_RE`` — don't
+# duplicate. Caption heuristics below match the 2 common MinerU layouts:
+# ``![]() ⏎ Figure N:`` or ``Figure N: ⏎ ![]()``.
+_CAPTION_AFTER_RE = re.compile(
+    r'!\[[^\]]*\]\(images/(?P<mn>[a-f0-9]{64}\.\w{2,4})\)\s*\n+\s*'
+    r'(?P<cap>(?:Figure|Fig\.?)\s*\d+[:.][^\n]{1,400})',
+    re.IGNORECASE,
+)
+_CAPTION_BEFORE_RE = re.compile(
+    r'(?P<cap>(?:Figure|Fig\.?)\s*\d+[:.][^\n]{1,400})\s*\n+\s*'
+    r'!\[[^\]]*\]\(images/(?P<mn>[a-f0-9]{64}\.\w{2,4})\)',
+    re.IGNORECASE,
+)
+FIG_SIZE_LIMIT = 10 * 1024 * 1024  # 10MB → trigger compression per spec §4
+WEBDAV_FIG_CB_LIMIT = int(os.environ.get("INGEST_FIG_CB_LIMIT", "3"))
+
+
+def _build_caption_map(md: str) -> dict[str, str]:
+    """Return ``{mineru_name → caption}`` for all image refs in ``md``.
+
+    AFTER (``![]() ⏎ Figure N:``) has priority over BEFORE (``Figure N: ⏎
+    ![]()``): this prevents cross-contamination when md alternates
+    ``img · caption · img`` — the caption belongs to the preceding image
+    (AFTER's hit) and shouldn't also be assigned to the next image via
+    BEFORE's pattern. Unmapped images simply don't appear in the result.
+    """
+    result: dict[str, str] = {}
+    claimed_spans: set[tuple[int, int]] = set()
+    for m in _CAPTION_AFTER_RE.finditer(md):
+        mn = m.group("mn")
+        if mn not in result:
+            result[mn] = m.group("cap").strip()
+            claimed_spans.add(m.span("cap"))
+    for m in _CAPTION_BEFORE_RE.finditer(md):
+        mn = m.group("mn")
+        if mn in result:
+            continue
+        if m.span("cap") in claimed_spans:
+            continue  # this caption already bound to an earlier image
+        result[mn] = m.group("cap").strip()
+    return result
+
+
+def _caption_for(mn: str, md: str) -> str | None:
+    """Single-name wrapper around ``_build_caption_map`` — used by tests and
+    direct callers. For bulk builds inside ingest_one, prefer
+    ``_build_caption_map`` to avoid O(N) re-scan of md."""
+    return _build_caption_map(md).get(mn)
+
+
+def _maybe_downscale(img_bytes: bytes) -> tuple[bytes, bool, int, int]:
+    """Return ``(bytes_out, downscaled_flag, width, height)``.
+
+    - If raw ≤ 10 MB: keep bytes as-is. Read only dims via PIL.
+    - If raw > 10 MB: PIL thumbnail → longest_edge 2048 → JPEG q=85. If
+      still > 10 MB: q=70. If STILL > 10 MB: return the q=70 bytes anyway
+      and let caller decide (WebDAV PUT may reject, but SQLite row still
+      gets created with webdav_path=None — figure still has metadata).
+    """
+    from PIL import Image
+    import io as _io
+    if len(img_bytes) <= FIG_SIZE_LIMIT:
+        im = Image.open(_io.BytesIO(img_bytes))
+        w, h = im.size
+        return img_bytes, False, w, h
+    im = Image.open(_io.BytesIO(img_bytes))
+    im.thumbnail((2048, 2048))
+    im_rgb = im.convert("RGB") if im.mode != "RGB" else im
+    for quality in (85, 70):
+        buf = _io.BytesIO()
+        im_rgb.save(buf, format="JPEG", quality=quality, optimize=True)
+        out = buf.getvalue()
+        if len(out) <= FIG_SIZE_LIMIT:
+            return out, True, im_rgb.size[0], im_rgb.size[1]
+    # Still oversize — return the q=70 version; caller may skip WebDAV.
+    return out, True, im_rgb.size[0], im_rgb.size[1]
+
+
+def _build_figures(md: str, images_raw: dict[str, bytes]) -> list[dict]:
+    """Turn MinerU's ``{filename.jpg: raw_bytes}`` dict into SQLite-ready
+    rows + the bytes to upload.
+
+    Each row has:
+        mineru_name   (filename with extension, e.g. ``<64hex>.jpg``)
+        content_sha   (sha256 of the BYTES WE'LL UPLOAD, post-downscale)
+        caption       (parsed from md if adjacent, else None)
+        bytes_len, width, height, mime
+        downscaled    (bool)
+        bytes_for_upload  — not persisted in SQLite, consumed by Stage A
+    """
+    import hashlib as _h
+    caption_map = _build_caption_map(md)
+    out: list[dict] = []
+    for name, raw in images_raw.items():
+        try:
+            final_bytes, was_down, w, h = _maybe_downscale(raw)
+        except Exception as e:
+            # PIL unsupported format / corrupt — skip image, keep paper going
+            logger.warning("figure %s decode/downscale err: %s", name, e)
+            continue
+        out.append({
+            "mineru_name": name,
+            "content_sha": _h.sha256(final_bytes).hexdigest(),
+            "caption":     caption_map.get(name),
+            "bytes_len":   len(final_bytes),
+            "width":       w,
+            "height":      h,
+            "mime":        "image/jpeg",
+            "downscaled":  was_down,
+            "webdav_path": None,    # filled by Stage A
+            "bytes_for_upload": final_bytes,
+        })
+    return out
 
 # ======================================================================
 # Zotero API helpers (minimal, just what ingest needs)
@@ -186,26 +306,162 @@ def _metadata_only_markdown(item: dict) -> str:
     return "\n".join(parts)
 
 
+def _qdrant_has_chunks(qd, paper_id: str) -> bool:
+    """Cheap probe: is there ≥1 Qdrant point for this paper_id? Used to
+    distinguish "already_done and fully wired" from "Stage C failed last
+    time so retry Qdrant only". Does NOT count — we only need exists-or-not."""
+    import urllib.request as _u, urllib.error as _ue, json as _j
+    url = (f"{qd._qdrant_base}/collections/{qd.collection}/points/scroll")
+    body = _j.dumps({
+        "filter": {"must": [{"key": "paper_id", "match": {"value": paper_id}}]},
+        "limit": 1, "with_payload": False, "with_vector": False,
+    }).encode()
+    req = _u.Request(url, data=body, method="POST",
+                     headers={"Content-Type": "application/json"})
+    try:
+        with _u.urlopen(req, timeout=15) as r:
+            data = _j.loads(r.read())
+    except (_ue.HTTPError, _ue.URLError, TimeoutError, OSError) as e:
+        # Fail-open: treat as "has chunks" to avoid spurious retries when
+        # Qdrant is flaky. Circuit breaker catches persistent outages.
+        logger.warning("qdrant probe for %s failed (%s), assuming has_chunks",
+                       paper_id, e)
+        return True
+    return bool(data.get("result", {}).get("points"))
+
+
+def _stage_a_upload_figures(sql, figures: list[dict], paper_id: str) -> int:
+    """Stage A: upload every figure to the independent WebDAV tree.
+
+    Mutates each figure dict in place, setting ``webdav_path`` on success.
+    Per-figure failures are logged + recorded in ``failures`` but don't stop
+    the other figures. A streak of ``WEBDAV_FIG_CB_LIMIT`` consecutive
+    outage-class errors trips a circuit breaker: the remaining figures get
+    ``webdav_path=None`` and can be retried later by
+    ``backfill_pending_figures``. Returns count of successfully uploaded.
+    """
+    from zotero_mcp import webdav as _wd
+    uploaded = 0
+    consec_out = 0
+    tripped = False
+    for f in figures:
+        if tripped:
+            # leave webdav_path=None; backfill will retry
+            continue
+        try:
+            rel = _wd.put_figure(paper_id, f["mineru_name"], f["bytes_for_upload"])
+            f["webdav_path"] = rel
+            uploaded += 1
+            consec_out = 0
+        except _wd.WebDAVOutageError as e:
+            sql.record_failure(paper_id, "webdav_figures",
+                               f"{f['mineru_name']}: {e!r}"[:400])
+            consec_out += 1
+            if consec_out >= WEBDAV_FIG_CB_LIMIT:
+                logger.error(
+                    "WebDAV figures CB trip on %s after %d consecutive outages — "
+                    "remaining %d figures deferred to backfill",
+                    paper_id, consec_out,
+                    sum(1 for g in figures if g.get("webdav_path") is None) - 1,
+                )
+                tripped = True
+        except Exception as e:
+            # non-outage (413, config, etc): log per-figure, keep going
+            sql.record_failure(paper_id, "webdav_figures",
+                               f"{f['mineru_name']}: {e!r}"[:400])
+            logger.warning("webdav put_figure %s/%s failed: %s",
+                           paper_id, f["mineru_name"], e)
+            consec_out = 0
+    return uploaded
+
+
+def _backfill_pending_figures(
+    sql, paper_id: str, tmp_pdf_path: Path, work_tmp: Path,
+) -> dict:
+    """Re-run only Stage A for figures that previously failed WebDAV upload.
+
+    Re-fetches the PDF + re-runs MinerU to get image bytes (we don't persist
+    bytes anywhere else), then uploads only the figures whose SQLite row
+    has ``webdav_path IS NULL``. Marks them uploaded via
+    ``mark_figure_uploaded``. Returns a stats dict.
+    """
+    pending = sql.pending_webdav_figures(paper_id)
+    if not pending:
+        return {"backfilled": 0, "remaining": 0}
+    wanted = {row["mineru_name"] for row in pending}
+    logger.info("backfill %s: %d figures pending", paper_id, len(wanted))
+    # Re-parse to get bytes. This is OK — MinerU filenames are cross-parse
+    # stable per spec §0.1 so we can address the same figure by mineru_name.
+    _, images_raw = convert_to_markdown_smart_with_images(tmp_pdf_path)
+    # Only upload the ones that are actually still pending.
+    from zotero_mcp import webdav as _wd
+    backfilled = 0
+    for name in wanted:
+        raw = images_raw.get(name)
+        if raw is None:
+            continue  # figure disappeared between parses — shouldn't happen
+        bytes_out, _down, _w, _h = _maybe_downscale(raw)
+        try:
+            rel = _wd.put_figure(paper_id, name, bytes_out)
+            sql.mark_figure_uploaded(paper_id, name, rel)
+            backfilled += 1
+        except Exception as e:
+            logger.warning("backfill put_figure %s/%s failed: %s",
+                           paper_id, name, e)
+    return {"backfilled": backfilled, "remaining": len(wanted) - backfilled}
+
+
 def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | float | int]:
-    """Process a single item. Returns stats dict."""
+    """Process a single item. Returns stats dict.
+
+    T0 pipeline (see plans/zotero-kg-t0-spec.md):
+      1. Resolve PDF bytes (WebDAV → Zotero cloud fallback)
+      2. MinerU parse → (md, images_dict); images_dict empty for non-PDF
+      3. Downscale >10MB images; compute content_sha + caption
+      4. LLM extract with figures (VLM chain → text fallback)
+      5. Stage A  WebDAV PUT each figure into /dav/zotero-kg-figures/<pid>/
+      6. Stage B  SQLite atomic save (figures + papers in one txn)
+      7. Stage C  Qdrant upsert (chunks carry figure_refs per payload)
+      8. Neo4j write (independent, per-paper retry-able)
+      9. Optional: md attachment upload (legacy Zotero sync)
+
+    Fast-path skip: if a paper is "fully done" (SQLite papers row exists +
+    Qdrant has chunks + no pending figures), return ``skip_done``. If only
+    subset is done, run only the missing stages.
+    """
     pid = item["key"]
     stats: dict[str, str | float | int] = {"pid": pid, "status": "ok"}
     t_start = time.time()
 
+    # Fast-path: papers row exists. Investigate whether all downstream stores
+    # have this paper; if anything's missing, we still have work to do below.
     if sql.already_done(pid):
-        stats["status"] = "skip_done"
-        return stats
+        has_qdrant = _qdrant_has_chunks(qd, pid)
+        pending_figs = sql.pending_webdav_figures(pid)
+        if has_qdrant and not pending_figs:
+            stats["status"] = "skip_done"
+            return stats
+        # Partial state — flag what's missing so downstream logic knows to
+        # only backfill Stage A / Stage C rather than full re-parse.
+        stats["partial"] = {
+            "pending_figures": len(pending_figs),
+            "qdrant_missing": not has_qdrant,
+        }
+        # Intentional fall-through: re-run the full pipeline, which is
+        # idempotent at every stage (WebDAV PUT overwrite, SQLite
+        # INSERT OR REPLACE + DELETE+INSERT figures, Qdrant upsert via
+        # deterministic UUIDv5 point ids, Neo4j MERGE).
 
     pdf = resolve_pdf_bytes(item)
     mineru_secs = 0.0
     metadata_only = False
-    md = None
+    md: str = ""
+    images_raw: dict[str, bytes] = {}
 
     if pdf is None:
-        # graceful degrade: build metadata-only md from abstract + Zotero fields
         md = _metadata_only_markdown(item)
         metadata_only = True
-        if len(md.strip()) < 120:  # title-only with no abstract → really nothing
+        if len(md.strip()) < 120:
             sql.record_failure(pid, "no_content",
                                "no PDF and no abstract/metadata body")
             stats["status"] = "skip_no_content"
@@ -216,7 +472,7 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         tmp_pdf.write_bytes(pdf)
         t_mineru = time.time()
         try:
-            md = convert_to_markdown_smart(tmp_pdf)
+            md, images_raw = convert_to_markdown_smart_with_images(tmp_pdf)
         except Exception as e:
             sql.record_failure(pid, "parse", repr(e)[:400])
             stats["status"] = "parse_err"
@@ -225,9 +481,9 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
             tmp_pdf.unlink(missing_ok=True)
         mineru_secs = time.time() - t_mineru
         if not md or len(md) < 500:
-            # parse produced nothing useful → fall through to metadata-only
             md = _metadata_only_markdown(item)
             metadata_only = True
+            images_raw = {}  # drop any garbage images if md was also garbage
             stats["mode"] = "meta_fallback"
             if len(md.strip()) < 120:
                 sql.record_failure(pid, "no_content",
@@ -235,14 +491,54 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
                 stats["status"] = "skip_no_content"
                 return stats
 
+    # Step 3 — build figures (downscale + caption + content_sha)
+    figures = _build_figures(md, images_raw) if images_raw else []
+    stats["figures"] = len(figures)
+
+    # Step 4 — LLM extract. Pass figures so VLM chain fires; extract_structured
+    # returns (paper, provider_name). None → extract failed after retries.
+    vlm_input = [
+        {"bytes": f["bytes_for_upload"], "caption": f.get("caption"),
+         "mime": f.get("mime", "image/jpeg")}
+        for f in figures
+    ]
     t_llm = time.time()
-    paper = extract_structured(md, title=item.get("title", ""), paper_id=pid)
+    paper, extract_provider = extract_structured(
+        md, title=item.get("title", ""), paper_id=pid,
+        figures=vlm_input or None,
+    )
     llm_secs = time.time() - t_llm
     if paper is None:
         sql.record_failure(pid, "extract", "LLM extract returned None")
         stats["status"] = "extract_err"
         return stats
+    stats["provider"] = extract_provider or "unknown"
 
+    # Step 5 — Stage A: WebDAV PUT each figure (with per-paper circuit
+    # breaker after WEBDAV_FIG_CB_LIMIT consecutive outages). Per-figure
+    # failures leave ``webdav_path=None`` in Stage B; later retries pick
+    # those up via ``_backfill_pending_figures``.
+    if figures:
+        stats["figs_uploaded"] = _stage_a_upload_figures(sql, figures, pid)
+
+    # Step 6 — Stage B: atomic SQLite save (figures + papers in one txn).
+    # Strip bytes_for_upload before handing to SQLite — that's Stage A's scratch.
+    sql_figures = [{k: v for k, v in f.items() if k != "bytes_for_upload"}
+                   for f in figures]
+    try:
+        sql.save_paper_with_figures(
+            paper, item_type=item["itemType"], md_text=md,
+            figures=sql_figures,
+            extract_provider=extract_provider or "unknown",
+            mineru_secs=mineru_secs, llm_secs=llm_secs,
+        )
+    except Exception as e:
+        sql.record_failure(pid, "sqlite", repr(e)[:400])
+        stats["status"] = "sqlite_err"
+        logger.warning("sqlite save_paper_with_figures %s failed: %s", pid, e)
+        return stats
+
+    # Step 7 — Stage C: Qdrant (S6 will enrich payload.figure_refs)
     try:
         chunks = qd.upsert_paper(paper, item_type=item["itemType"], markdown=md)
         stats["chunks"] = chunks
@@ -250,6 +546,7 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         sql.record_failure(pid, "qdrant", repr(e)[:400])
         logger.warning("qdrant upsert failed for %s: %s", pid, e)
 
+    # Step 8 — Neo4j
     try:
         ne.write_paper(paper, item_type=item["itemType"],
                        authors=item.get("creators", []))
@@ -257,12 +554,8 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
         sql.record_failure(pid, "neo4j", repr(e)[:400])
         logger.warning("neo4j write failed for %s: %s", pid, e)
 
-    sql.save_paper(paper, item_type=item["itemType"],
-                   md_text=md, mineru_secs=mineru_secs, llm_secs=llm_secs)
-
-    # Attach the extracted markdown as a Zotero child attachment so downstream
-    # agents can read the parsed text directly, without re-running MinerU.
-    # Gated by ZOTERO_MCP_ATTACH_MD=1 to preserve backwards compatibility.
+    # Step 9 — optional md attachment upload (Zotero-level sync, unrelated to
+    # figures tree). Gated by ZOTERO_MCP_ATTACH_MD=1 for back-compat.
     if os.environ.get("ZOTERO_MCP_ATTACH_MD", "1") == "1" and not metadata_only:
         try:
             from scripts.backfill_md_attachments import (
@@ -332,6 +625,12 @@ def main():
 
     stats_per_status: dict[str, int] = {}
     t0 = time.time()
+    from zotero_mcp.webdav import WebDAVOutageError
+    CB_LIMIT = int(os.environ.get("INGEST_WEBDAV_OUTAGE_LIMIT", "8"))
+
+    def _is_webdav_outage_crash(err_repr: str) -> bool:
+        return "WebDAVOutageError" in err_repr or "webdav put unavailable" in err_repr
+
     if args.workers <= 1:
         for i, it in enumerate(items, 1):
             s = ingest_one(it, sql=sql, qd=qd, ne=ne, work_tmp=work_tmp)
@@ -339,6 +638,8 @@ def main():
             logger.info("[%d/%d] %s %s", i, len(items), it["key"], s)
     else:
         logger.info("running with %d concurrent workers", args.workers)
+        consecutive_webdav_out = 0
+        tripped = False
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futs = {pool.submit(ingest_one, it, sql=sql, qd=qd, ne=ne,
                                 work_tmp=work_tmp): it for it in items}
@@ -346,8 +647,18 @@ def main():
                 it = futs[fut]
                 try:
                     s = fut.result()
+                    consecutive_webdav_out = 0
+                except WebDAVOutageError as e:
+                    s = {"pid": it["key"], "status": "webdav_outage", "err": repr(e)[:200]}
+                    consecutive_webdav_out += 1
                 except Exception as e:
-                    s = {"pid": it["key"], "status": "crash", "err": repr(e)[:200]}
+                    err_repr = repr(e)[:200]
+                    if _is_webdav_outage_crash(err_repr):
+                        consecutive_webdav_out += 1
+                        s = {"pid": it["key"], "status": "webdav_outage", "err": err_repr}
+                    else:
+                        consecutive_webdav_out = 0
+                        s = {"pid": it["key"], "status": "crash", "err": err_repr}
                 stats_per_status[s["status"]] = stats_per_status.get(s["status"], 0) + 1
                 elapsed = time.time() - t0
                 rate = i / elapsed if elapsed > 0 else 0
@@ -355,6 +666,13 @@ def main():
                 logger.info("[%d/%d @ %.0f%%] %s %s  rate=%.2f/s  ETA=%.0fm",
                             i, len(items), 100*i/len(items), it["key"], s,
                             rate, eta/60)
+                if consecutive_webdav_out >= CB_LIMIT and not tripped:
+                    tripped = True
+                    logger.error("CIRCUIT BREAKER: %d consecutive WebDAV outages — "
+                                 "aborting remaining %d futures. Re-run when WebDAV recovers.",
+                                 consecutive_webdav_out, len(futs) - i)
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
 
     sql.close()
     ne.close()

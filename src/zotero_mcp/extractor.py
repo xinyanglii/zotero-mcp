@@ -62,49 +62,91 @@ PROVIDER_CHAIN = [
         "key_envs":  ("KIMI_API_KEY", "MOONSHOT_API_KEY"),
         "protocol":  "anthropic",
     },
-    {
-        "name":      "qwen3max",
-        # DashScope qwen3-max (1M tokens free quota, ~915k remaining as of
-        # 2026-04-21, expires 2026-06-24). ~20s/paper, 8-10/10 fields, often
-        # even higher methods_used density than k2.5 (observed 10.3 avg vs
-        # 8.0). Effective 2nd-3rd slot.
-        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     os.getenv("QWEN_MODEL", "qwen3-max"),
-        "key_envs":  ("DASHSCOPE_API_KEY",),
-        "protocol":  "openai",
-    },
-    {
-        "name":      "qwen3max-preview",
-        # Separate 1M free quota independent of qwen3-max. Expires 2026-06-24.
-        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     "qwen3-max-preview",
-        "key_envs":  ("DASHSCOPE_API_KEY",),
-        "protocol":  "openai",
-    },
-    {
-        "name":      "qwen3max-0923",
-        # Pinned snapshot, separate 1M free quota. Expires 2026-06-24.
-        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     "qwen3-max-2025-09-23",
-        "key_envs":  ("DASHSCOPE_API_KEY",),
-        "protocol":  "openai",
-    },
-    {
-        "name":      "qwen3max-0123",
-        # Newer pinned snapshot. Expect similar 1M free quota.
-        "url":       os.getenv("QWEN_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
-        "model":     "qwen3-max-2026-01-23",
-        "key_envs":  ("DASHSCOPE_API_KEY",),
-        "protocol":  "openai",
-    },
+    # 2026-04-22 02:40 refresh: glm-4.7/5/5.1 free tiers all exhausted (403);
+    # qwen3-max / qwen3-max-preview also exhausted. Re-probed DashScope and
+    # picked three currently-callable models covering different strengths:
+    #   - dashscope-glm-4.6: newest GLM non-stream on DashScope (glm-4.5/4.5-air
+    #     stream-only; glm-5.x free tier gone).
+    #   - qwen3-coder-plus: coder variant tuned for structured output / JSON,
+    #     ideal for our ExtractedPaper schema.
+    #   - qwen-plus-latest: Kimi-parity general quality, ¥0.8/1M input — cheap
+    #     safety net when coder-plus falters.
+    # Burn DashScope free tier FIRST, then fall back to Z.AI GLM-5 direct.
+    # 2026-04-22 07:12 refresh: 3 个 qwen3-coder snapshots 今日耗尽已移除；
+    # qwen-plus-latest 也删除（走这个在消耗付费额度）。替换为 8 个 qwen-plus
+    # dated snapshots，每个独立 1M-token 免费额度（expire 2026-06-24），总计
+    # 8M tokens 纯 free 容量。zai（订阅，零边际成本）作为 #2 主力，DashScope
+    # snapshots 做深度兜底。排序：newest → oldest。
     {
         "name":      "zai",
-        # Z.AI GLM-5 (coding plan, free daily quota). ~82s/paper due to heavy
-        # reasoning tokens (3000+). Slowest but kept as last-resort free
-        # fallback if all paid providers are exhausted.
         "url":       os.getenv("ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"),
         "model":     os.getenv("ZAI_MODEL", "glm-5"),
         "key_envs":  ("Z_AI_API_KEY", "ZAI_API_KEY"),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-1201",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-12-01",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0911",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-09-11",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0728",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-07-28",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0714",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-07-14",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0428",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-04-28",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0125",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-2025-01-25",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-1220",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-1220",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    {
+        "name":      "dashscope-qwen-plus-0112",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-0112",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
+        "protocol":  "openai",
+    },
+    # qwen-plus-latest：付费 alias（¥0.8/1M in, ¥2/1M out）。8 个 dated snapshot
+    # 共 8M 免费 + kimi/zai 订阅之后，这是真·最后兜底，避免 paper 进 extract_err。
+    {
+        "name":      "dashscope-qwen-plus-latest",
+        "url":       "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":     "qwen-plus-latest",
+        "key_envs":  ("DASHSCOPE_API_KEY",),
         "protocol":  "openai",
     },
 ]
@@ -123,6 +165,44 @@ def _active_providers() -> list[dict]:
             "protocol": os.environ.get("HELPER_LLM_PROVIDER", "anthropic").lower(),
         }]
     return PROVIDER_CHAIN
+
+
+# VLM chain for figure-aware extraction. T0 2026-04-22 · grounded against
+# real probe tests:
+#   - kimi-for-coding on coding endpoint accepts vision (1.3s)
+#   - glm-4.6v on Z.AI coding plan accepts vision (3.7s); glm-5v-turbo
+#     requires paid recharge, not in current subscription
+#   - qwen3-vl-plus on DashScope compatible-mode accepts vision (6.4s)
+# ``extract_structured(figures=[...])`` tries this chain first; on all-fail
+# (or empty figures) it falls back to the text PROVIDER_CHAIN.
+VLM_PROVIDER_CHAIN = [
+    {
+        "name":     "kimi-vl",
+        "url":      os.getenv("KIMI_URL", "https://api.kimi.com/coding/v1/messages"),
+        "model":    os.getenv("KIMI_VL_MODEL", "kimi-for-coding"),
+        "key_envs": ("KIMI_API_KEY", "MOONSHOT_API_KEY"),
+        "protocol": "anthropic-vision",
+    },
+    {
+        "name":     "zai-glm-4.6v",
+        "url":      os.getenv("ZAI_URL", "https://api.z.ai/api/coding/paas/v4/chat/completions"),
+        "model":    os.getenv("ZAI_VL_MODEL", "glm-4.6v"),
+        "key_envs": ("Z_AI_API_KEY", "ZAI_API_KEY"),
+        "protocol": "openai-vision",
+    },
+    {
+        "name":     "dashscope-qwen3-vl-plus",
+        "url":      "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model":    os.getenv("QWEN_VL_MODEL", "qwen3-vl-plus"),
+        "key_envs": ("DASHSCOPE_API_KEY",),
+        "protocol": "openai-vision",
+    },
+]
+
+# Cap on how many figures to actually send to the VLM per paper. Everything
+# beyond this is still saved to SQLite/WebDAV — only the VLM input is capped
+# to keep token budget predictable. 12 × ~1.5k tokens/img ≈ 18k tokens extra.
+VLM_MAX_FIGURES = int(os.getenv("VLM_MAX_FIGURES", "12"))
 
 
 # ---------- schema ----------
@@ -268,24 +348,70 @@ def _is_fallback_worthy(http_code: int, body: str) -> bool:
     if http_code in (401, 403, 429, 402, 500, 502, 503, 504, 529):
         return True
     b = (body or "").lower()
+    # 2026-04-22: zai glm-5 returns HTTP 400 "Prompt exceeds max length" (code
+    # 1261) on long papers. Other providers (qwen-plus) have larger context
+    # windows, so fall through instead of aborting the chain.
     for marker in ("quota", "rate limit", "too many", "overloaded",
-                   "capacity", "insufficient_balance", "billing"):
+                   "capacity", "insufficient_balance", "billing",
+                   "prompt exceeds", "max length", "context length",
+                   "token limit", "input too long", "input is too long"):
         if marker in b:
             return True
     return False
 
 
 def _call_one(provider: dict, user_prompt: str,
-              *, max_tokens: int, timeout: int) -> str:
+              *, max_tokens: int, timeout: int,
+              figures: list[dict] | None = None) -> str:
     """Single-provider attempt. Raises urllib.error.HTTPError on HTTP failure
-    (body embedded) or ConnectionError on transport failure."""
+    (body embedded) or ConnectionError on transport failure.
+
+    ``figures`` (optional): list of ``{"bytes": raw_jpeg_bytes, "caption": str}``
+    entries. Only consumed when ``provider["protocol"]`` is one of the
+    ``*-vision`` variants, in which case the content is built as a multimodal
+    message (text + image parts). For text-only protocols figures are ignored.
+    """
+    import base64 as _b64
     api_key = _lookup_key(provider["key_envs"])
     if not api_key:
         raise RuntimeError(f"no API key for provider {provider['name']}: "
                            f"tried {provider['key_envs']}")
-    messages = [{"role": "user", "content": SYSTEM_PROMPT + "\n\n" + user_prompt}]
+    proto = provider["protocol"]
+    prompt_text = SYSTEM_PROMPT + "\n\n" + user_prompt
 
-    if provider["protocol"] == "anthropic":
+    # ---- Build `messages` per protocol ----
+    if proto == "anthropic":
+        messages = [{"role": "user", "content": prompt_text}]
+    elif proto == "openai":
+        messages = [{"role": "user", "content": prompt_text}]
+    elif proto == "anthropic-vision":
+        content = [{"type": "text", "text": prompt_text}]
+        for f in (figures or [])[:VLM_MAX_FIGURES]:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64", "media_type": f.get("mime", "image/jpeg"),
+                    "data": _b64.b64encode(f["bytes"]).decode(),
+                },
+            })
+        content.append({"type": "text", "text": VISION_TAIL_PROMPT})
+        messages = [{"role": "user", "content": content}]
+    elif proto == "openai-vision":
+        content = [{"type": "text", "text": prompt_text}]
+        for f in (figures or [])[:VLM_MAX_FIGURES]:
+            b64 = _b64.b64encode(f["bytes"]).decode()
+            mime = f.get("mime", "image/jpeg")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": VISION_TAIL_PROMPT})
+        messages = [{"role": "user", "content": content}]
+    else:
+        raise RuntimeError(f"unknown provider protocol: {proto!r}")
+
+    # ---- Build payload + headers per protocol family ----
+    if proto in ("anthropic", "anthropic-vision"):
         payload = json.dumps({
             "model": provider["model"],
             "max_tokens": max_tokens,
@@ -296,14 +422,20 @@ def _call_one(provider: dict, user_prompt: str,
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
         }
-    else:  # openai-compatible
-        payload = json.dumps({
+    else:  # openai / openai-vision
+        body: dict[str, Any] = {
             "model": provider["model"],
             "max_tokens": max_tokens,
             "messages": messages,
-            "response_format": {"type": "json_object"},
             "temperature": 0.2,
-        }).encode()
+        }
+        # response_format=json_object is text-only in most providers. For
+        # VL dashscope/Z.AI the hint is sometimes rejected with 400 — only
+        # add for pure text protocol, VLM output gets parsed by
+        # _extract_json_object either way.
+        if proto == "openai":
+            body["response_format"] = {"type": "json_object"}
+        payload = json.dumps(body).encode()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
@@ -313,30 +445,52 @@ def _call_one(provider: dict, user_prompt: str,
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
 
-    if provider["protocol"] == "anthropic":
+    if proto in ("anthropic", "anthropic-vision"):
+        # Anthropic vision puts text responses as content[0].text (same as text)
         return data["content"][0]["text"].strip()
     return data["choices"][0]["message"]["content"].strip()
 
 
-def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) -> str:
-    """Provider-chain aware call. Yields the first successful response text.
+VISION_TAIL_PROMPT = (
+    "\n\nThe images above are figures extracted from the paper PDF. If any "
+    "show architectures / flowcharts / experiment curves / comparison tables, "
+    "describe their **visual structure** (components, hierarchy, axes meaning, "
+    "compared items) when populating the `methods_proposed` and `results` "
+    "fields of the JSON — do not merely copy the figure caption. Return the "
+    "same JSON schema as for text-only extraction."
+)
 
-    Raises the last seen HTTPError if every provider fails on a fallback-worthy
-    condition, or propagates immediately on a non-fallback error (so we don't
-    silently mask schema bugs).
+
+def _call_llm_chain(
+    providers: list[dict], user_prompt: str,
+    *,
+    figures: list[dict] | None = None,
+    max_tokens: int = 16000, timeout: int = 360,
+    chain_label: str = "extractor",
+) -> tuple[str, str]:
+    """Try ``providers`` in order; return ``(response_text, provider_name)``
+    on first success. Raises the last exception if every provider fails on a
+    fallback-worthy condition, or propagates a non-fallback error immediately.
+
+    ``figures`` is threaded through to ``_call_one`` — only providers with a
+    ``*-vision`` protocol actually use them; text providers ignore.
     """
-    providers = _active_providers()
-    if not getattr(_call_llm, "_logged_chain", False):
-        logger.info("extractor active providers: %s",
-                    [p["name"] for p in providers])
-        _call_llm._logged_chain = True  # type: ignore[attr-defined]
+    # Once-per-process log: which chain is active.
+    key = f"_logged_chain_{chain_label}"
+    if not getattr(_call_llm_chain, key, False):
+        logger.info("%s active providers: %s",
+                    chain_label, [p["name"] for p in providers])
+        setattr(_call_llm_chain, key, True)
     last_exc: Exception | None = None
     for i, p in enumerate(providers):
         try:
-            out = _call_one(p, user_prompt, max_tokens=max_tokens, timeout=timeout)
+            out = _call_one(
+                p, user_prompt,
+                max_tokens=max_tokens, timeout=timeout, figures=figures,
+            )
             if i > 0:
-                logger.info("extractor: fell back to %s OK", p["name"])
-            return out
+                logger.info("%s: fell back to %s OK", chain_label, p["name"])
+            return out, p["name"]
         except urllib.error.HTTPError as e:
             body = ""
             try:
@@ -355,8 +509,8 @@ def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) 
                     pass
             fallback = _is_fallback_worthy(e.code, body)
             logger.warning(
-                "extractor: %s HTTP %d%s  body=%s",
-                p["name"], e.code,
+                "%s: %s HTTP %d%s  body=%s",
+                chain_label, p["name"], e.code,
                 " (fallback-worthy)" if fallback else "",
                 body[:200],
             )
@@ -365,13 +519,23 @@ def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) 
                 raise
         except RuntimeError as e:
             # missing key etc — skip provider
-            logger.warning("extractor: skip %s: %s", p["name"], e)
+            logger.warning("%s: skip %s: %s", chain_label, p["name"], e)
             last_exc = e
         except Exception as e:
-            logger.warning("extractor: %s transport err: %s", p["name"], e)
+            logger.warning("%s: %s transport err: %s", chain_label, p["name"], e)
             last_exc = e
     assert last_exc is not None
     raise last_exc
+
+
+def _call_llm(user_prompt: str, *, max_tokens: int = 16000, timeout: int = 360) -> str:
+    """Legacy text-only entry. Delegates to ``_call_llm_chain`` with the text
+    PROVIDER_CHAIN and drops the provider-name for back-compat callers."""
+    text, _name = _call_llm_chain(
+        _active_providers(), user_prompt,
+        max_tokens=max_tokens, timeout=timeout, chain_label="extractor",
+    )
+    return text
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -410,25 +574,33 @@ def extract_structured(
     title: str,
     paper_id: str,
     max_retries: int = 2,
-) -> ExtractedPaper | None:
-    """Run the LLM on the markdown and return a validated ExtractedPaper.
+    figures: list[dict] | None = None,
+) -> tuple[ExtractedPaper | None, str | None]:
+    """Run the LLM on the markdown and return ``(paper, provider_name)``.
 
-    Returns None after logging when the model repeatedly fails to produce
-    valid JSON — better to skip than corrupt the graph.
+    - ``figures=None`` or ``figures=[]``  → text PROVIDER_CHAIN only.
+    - ``figures=[{"bytes": b"...", ...}]`` → VLM_PROVIDER_CHAIN first; on
+      *all-fail* (every VLM provider exhausts its fallback paths) falls back
+      to the text chain (paper still ingests, just without figure context).
+
+    Returns ``(None, None)`` after logging when every chain + retry fails to
+    produce valid JSON — better to skip than corrupt the graph. Callers use
+    the returned ``provider_name`` as ``papers.extract_provider`` for audit.
     """
     truncated = _truncate(markdown, MAX_INPUT_TOKENS - 4000)
     user_msg = f"paper_id={paper_id}\ntitle={title}\n\n=== Markdown ===\n{truncated}"
-
+    wants_vlm = bool(figures)
     last_err, last_raw = "unknown", ""
+
     for attempt in range(max_retries + 1):
         try:
-            raw = _call_llm(user_msg)
+            raw, provider_name = _run_extract_call(user_msg, figures if wants_vlm else None)
             last_raw = raw
             data = _extract_json_object(raw)
             data["paper_id"] = paper_id
             paper = ExtractedPaper.model_validate(data)
-            logger.info("extracted paper_id=%s", paper_id)
-            return paper
+            logger.info("extracted paper_id=%s via %s", paper_id, provider_name)
+            return paper, provider_name
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")[:400]
             last_err = f"HTTP {e.code}: {body}"
@@ -443,4 +615,44 @@ def extract_structured(
             time.sleep(min(2 ** attempt, 10))
 
     _log_schema_error(paper_id, last_raw, last_err)
-    return None
+    return None, None
+
+
+def _run_extract_call(
+    user_msg: str, figures: list[dict] | None,
+) -> tuple[str, str]:
+    """One attempt of extract. If ``figures`` provided, try VLM chain first;
+    on VLM-all-fail (every provider exhausted), fall back to text chain.
+    Returns ``(raw_response_text, provider_name)``."""
+    if figures:
+        try:
+            return _call_llm_chain(
+                VLM_PROVIDER_CHAIN, user_msg, figures=figures,
+                chain_label="vlm-extractor",
+            )
+        except Exception as e:
+            # Any VLM-chain exhaustion (HTTP 4xx/5xx, RuntimeError for missing
+            # keys, transport errors) → degrade to text chain so the paper
+            # still ingests with a less rich but valid JSON. Log the concrete
+            # error for diagnosis. Spec §4 "VLM 全挂 → 降级纯文本".
+            if isinstance(e, urllib.error.HTTPError):
+                body = ""
+                try:
+                    body = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    pass
+                logger.warning(
+                    "VLM chain exhausted (HTTP %d: %s), degrading to text chain",
+                    e.code, body)
+            else:
+                logger.warning(
+                    "VLM chain exhausted (%s: %s), degrading to text chain",
+                    type(e).__name__, e)
+        text, name = _call_llm_chain(
+            _active_providers(), user_msg, chain_label="extractor",
+        )
+        return text, f"{name}+text-fallback"
+    # No figures → text chain directly.
+    return _call_llm_chain(
+        _active_providers(), user_msg, chain_label="extractor",
+    )
