@@ -181,9 +181,19 @@ T3_MD_ACCEPT_LEN = int(os.environ.get("T3_MD_ACCEPT_LEN", "500"))
 # listed here go through the headless-browser + cookies path; all others
 # stay on the plain urllib tier. This keeps browser launch overhead off the
 # hot path for the 90%+ of URLs that don't need it.
+#
+# Known-working mappings (verified 2026-04-22):
+#   zhihu.com      — z_c0 cookie grants full article access.
+#   xiaohongshu.com — web_session + id_token + xhs xsec_token in share URL
+#                     together give note body + comments. SPA needs extra
+#                     settle time, handled by T3_PLAYWRIGHT_SETTLE_MS below.
 T3_AUTH_COOKIE_MAP_DEFAULT = {
-    "zhihu.com": "~/.config/zotero-kg/zhihu_cookies.json",
+    "zhihu.com":      "~/.config/zotero-kg/zhihu_cookies.json",
+    "xiaohongshu.com": "~/.config/zotero-kg/xhs_cookies.json",
 }
+# How long to wait after domcontentloaded for the SPA to hydrate article
+# body. 3s was enough for Zhihu; xhs needs ~5s to render .note-container.
+T3_PLAYWRIGHT_SETTLE_MS = int(os.environ.get("T3_PLAYWRIGHT_SETTLE_MS", "5000"))
 
 
 def _parse_cookie_map_env() -> dict[str, str]:
@@ -283,7 +293,10 @@ def fetch_markdown_via_playwright_cookies(url: str, cookie_json_path: str) -> st
             page = ctx.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(3000)   # let React render article body
+                # Settle the SPA — React / Vue etc. hydrate article body
+                # after DOM ready. 5s covers zhihu (~1-2s) and xiaohongshu
+                # (~4-5s); longer sites can override via env.
+                page.wait_for_timeout(T3_PLAYWRIGHT_SETTLE_MS)
                 body_text = page.evaluate("() => document.body.innerText")
             finally:
                 browser.close()

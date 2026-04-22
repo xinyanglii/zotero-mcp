@@ -351,6 +351,31 @@ def test_auth_cookies_for_zhihu_url_hits(monkeypatch, tmp_path):
     assert _auth_cookies_for_url("https://www.zhihu.com/answer/1") == str(cookies_file)
 
 
+def test_auth_cookies_for_xhs_url_hits(monkeypatch, tmp_path):
+    """xiaohongshu.com — including discovery/item share URLs with query params."""
+    cookies_file = tmp_path / "xhs.json"
+    cookies_file.write_text("[]")
+    monkeypatch.setenv("T3_AUTH_COOKIES", f"xiaohongshu.com:{cookies_file}")
+    url1 = "https://www.xiaohongshu.com/explore/abc123"
+    url2 = ("https://www.xiaohongshu.com/discovery/item/69e0a950000000001a03013e"
+            "?xsec_token=ABC&xsec_source=pc_share")
+    assert _auth_cookies_for_url(url1) == str(cookies_file)
+    assert _auth_cookies_for_url(url2) == str(cookies_file)
+
+
+def test_auth_cookies_multiple_entries(monkeypatch, tmp_path):
+    """Multi-host config: ';' separates entries, correct host → correct file."""
+    zhihu_f = tmp_path / "zhihu.json"; zhihu_f.write_text("[]")
+    xhs_f = tmp_path / "xhs.json"; xhs_f.write_text("[]")
+    monkeypatch.setenv(
+        "T3_AUTH_COOKIES",
+        f"zhihu.com:{zhihu_f};xiaohongshu.com:{xhs_f}",
+    )
+    assert _auth_cookies_for_url("https://zhihu.com/x") == str(zhihu_f)
+    assert _auth_cookies_for_url("https://www.xiaohongshu.com/explore/x") == str(xhs_f)
+    assert _auth_cookies_for_url("https://unrelated.com/x") is None
+
+
 def test_auth_cookies_for_nonmatching_url_misses(monkeypatch, tmp_path):
     cookies_file = tmp_path / "zhihu.json"
     cookies_file.write_text("[]")
