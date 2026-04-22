@@ -28,6 +28,30 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Tier 1 circuit breaker state — process-local, reset on restart. If the
+# self-hosted mineru-api daemon is dead (systemctl --user stop, container
+# crash, etc.) every ingest_one call would eat 20-30s of HTTP timeout
+# before falling through. ``MINERU_TIER1_FAIL_LIMIT`` consecutive failures
+# flips a flag that skips Tier 1 for the rest of this process. Workaround
+# if restarted incorrectly: bump env to higher number or fix the daemon.
+_TIER1_FAIL_LIMIT = int(os.environ.get("MINERU_TIER1_FAIL_LIMIT", "3"))
+_tier1_failures = 0
+
+
+def _tier1_tripped() -> bool:
+    return _tier1_failures >= _TIER1_FAIL_LIMIT
+
+
+def _tier1_record_failure() -> None:
+    global _tier1_failures
+    _tier1_failures += 1
+    if _tier1_failures == _TIER1_FAIL_LIMIT:
+        logger.error(
+            "mineru Tier 1 (self-hosted) circuit breaker tripped after %d "
+            "consecutive failures — skipping for the rest of this process",
+            _tier1_failures,
+        )
+
 
 def _mineru_bin() -> str:
     env_override = os.getenv("MINERU_BIN", "").strip()
@@ -279,7 +303,6 @@ def convert_pdf_mineru_cloud_with_images(
     api_base = "https://mineru.net/api/v4"
 
     # Step 1: request signed upload URL
-    t_start = time.time()
     try:
         resp = requests.post(
             f"{api_base}/file-urls/batch",
@@ -307,31 +330,50 @@ def convert_pdf_mineru_cloud_with_images(
         raise RuntimeError(f"mineru cloud: malformed response: {inner}")
     upload_url = file_urls[0]
 
-    # Step 2: PUT bytes to OSS presigned URL (NO Content-Type header)
+    # Step 2: PUT bytes to OSS presigned URL (NO Content-Type header — urllib
+    # auto-adds application/x-www-form-urlencoded which breaks OSS signature;
+    # requests doesn't by default).
     try:
         put_resp = requests.put(upload_url, data=pdf_bytes, timeout=120)
         put_resp.raise_for_status()
     except Exception as e:
         raise RuntimeError(f"mineru cloud: OSS upload failed: {e}") from e
 
-    # Step 3: poll status
+    # Step 3: poll status. Budget reset here (Finding #1) — upload may eat
+    # several minutes for large PDFs / weak networks, but ``total_timeout``
+    # is meant for the server-side extraction time, not end-to-end.
+    t_poll_start = time.time()
     result_url: str | None = None
     state = "pending"
+    backoff = poll_interval    # grows on transient errors, reset on success
     while state not in ("done", "failed"):
-        if time.time() - t_start > total_timeout:
+        if time.time() - t_poll_start > total_timeout:
             raise RuntimeError(
                 f"mineru cloud: poll timeout after {total_timeout}s "
                 f"(last state={state})")
-        time.sleep(poll_interval)
+        time.sleep(backoff)
         try:
             poll_resp = requests.get(
                 f"{api_base}/extract-results/batch/{batch_id}",
                 headers=hdr_auth, timeout=30,
             )
+            sc = poll_resp.status_code
+            # Auth/resource-level errors are fatal — don't burn budget.
+            if sc in (401, 403, 404):
+                raise RuntimeError(
+                    f"mineru cloud: poll HTTP {sc} (fatal — token/batch bad): "
+                    f"{poll_resp.text[:200]}")
             poll_resp.raise_for_status()
             poll = poll_resp.json()
+            backoff = poll_interval   # success → reset exp-backoff
+        except RuntimeError:
+            raise
         except Exception as e:
-            logger.debug("mineru cloud: poll transient err (%s), retrying", e)
+            # Transient (network flake, 502 gateway, timeout). Exp backoff
+            # capped at 30s so a brief outage doesn't hammer + long outage
+            # still respects total_timeout.
+            backoff = min(backoff * 2, 30)
+            logger.debug("mineru cloud: poll transient (%s), backoff=%ds", e, backoff)
             continue
         er = (poll.get("data", {}).get("extract_result") or [{}])[0]
         state = er.get("state", "unknown")
@@ -345,7 +387,7 @@ def convert_pdf_mineru_cloud_with_images(
     if not result_url:
         raise RuntimeError("mineru cloud: no full_zip_url in done state")
 
-    # Step 4-5: download zip + extract md + images
+    # Step 4: download zip
     try:
         zr = requests.get(result_url, timeout=120)
         zr.raise_for_status()
@@ -353,19 +395,27 @@ def convert_pdf_mineru_cloud_with_images(
     except Exception as e:
         raise RuntimeError(f"mineru cloud: result zip download failed: {e}") from e
 
+    # Step 5: extract md + images; narrow BadZipFile so log shows "corrupt"
+    # distinct from other failures (Finding #5).
     md_text = ""
     images: dict[str, bytes] = {}
-    with _zipfile.ZipFile(_io.BytesIO(zbytes)) as zf:
-        for name in zf.namelist():
-            if name == "full.md":
-                md_text = zf.read(name).decode("utf-8", errors="replace")
-            elif name.startswith("images/") and not name.endswith("/"):
-                # Strip "images/" prefix → match self-hosted API's key format
-                # (filename with extension, no directory)
-                fname = name.split("/", 1)[1]
-                images[fname] = zf.read(name)
-    if not md_text:
-        raise RuntimeError("mineru cloud: zip missing full.md")
+    try:
+        with _zipfile.ZipFile(_io.BytesIO(zbytes)) as zf:
+            for name in zf.namelist():
+                if name == "full.md":
+                    md_text = zf.read(name).decode("utf-8", errors="replace")
+                elif name.startswith("images/") and not name.endswith("/"):
+                    # Strip "images/" prefix → match self-hosted API's key
+                    # format (filename with extension, no directory)
+                    fname = name.split("/", 1)[1]
+                    images[fname] = zf.read(name)
+    except _zipfile.BadZipFile as e:
+        raise RuntimeError(
+            f"mineru cloud: corrupt zip ({len(zbytes)} bytes): {e}") from e
+
+    # Finding #4: whitespace-only md isn't useful; treat as empty.
+    if not md_text.strip():
+        raise RuntimeError("mineru cloud: full.md empty/whitespace")
     return md_text, images
 
 
@@ -393,8 +443,11 @@ def convert_pdf_mineru_with_images(
     """
     errors: list[str] = []
 
-    # Tier 1: self-hosted mineru-api daemon
-    if os.environ.get("MINERU_API_URL"):
+    # Tier 1: self-hosted mineru-api daemon. Circuit-break after
+    # ``_TIER1_FAIL_LIMIT`` consecutive failures in this process — otherwise
+    # a dead daemon + stale env var costs 20-30s HTTP timeout per paper,
+    # which for a 4k-paper batch burns hours (Finding #6).
+    if os.environ.get("MINERU_API_URL") and not _tier1_tripped():
         try:
             if want_images:
                 return convert_pdf_mineru_api_with_images(
@@ -404,15 +457,17 @@ def convert_pdf_mineru_with_images(
                 pdf_path, backend=backend, lang=lang, timeout=timeout,
             ), {}
         except Exception as e:
+            _tier1_record_failure()
             errors.append(f"mineru-api: {e}")
             logger.warning("mineru Tier 1 (self-hosted) failed: %s", e)
 
-    # Tier 2: MinerU Cloud API
+    # Tier 2: MinerU Cloud API. Language passes through (Finding #7 —
+    # previous code forced ch→en, dropping the Chinese-document hint).
     if os.environ.get("MINERU_CLOUD_TOKEN"):
         try:
             md, images = convert_pdf_mineru_cloud_with_images(
-                pdf_path, lang=("en" if lang in ("en","ch") else lang),
-                total_timeout=timeout,
+                pdf_path, lang=lang, total_timeout=timeout,
+                model_version=os.environ.get("MINERU_CLOUD_MODEL", "vlm"),
             )
             return (md, images if want_images else {})
         except Exception as e:

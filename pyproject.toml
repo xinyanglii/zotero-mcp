@@ -95,3 +95,8 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
 ignore = ["E501"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires live external services (MINERU_CLOUD_TOKEN, Neo4j, CrossRef etc.) — skipped by default, run with `pytest -m integration`",
+]
