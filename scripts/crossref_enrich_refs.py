@@ -99,6 +99,7 @@ def _init_progress_db() -> sqlite3.Connection:
     PROGRESS_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(PROGRESS_DB), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS crossref_progress (
             ref_id          TEXT PRIMARY KEY,
@@ -422,6 +423,98 @@ def run(args) -> None:
             print(f"  status={res['status']} sim={res.get('sim','-')}")
 
 
+# ---------------------------------------------------------------------------
+# Pending-review triage CLI (Finding 6 — 904 rows in SQLite otherwise stranded)
+# ---------------------------------------------------------------------------
+def cmd_list_pending(args) -> None:
+    """Print all pending_review rows with ref title + candidate CrossRef DOI + sim."""
+    conn = _init_progress_db()
+    rows = conn.execute(
+        """SELECT ref_id, crossref_doi, crossref_score, title_sim, crossref_title
+           FROM crossref_progress WHERE status='pending_review'
+           ORDER BY title_sim DESC"""
+    ).fetchall()
+    conn.close()
+    if not rows:
+        print("(no pending_review rows)")
+        return
+    # Pull original ref titles from Neo4j for comparison
+    ne = Neo4jWriter(
+        os.environ["NEO4J_ZOTERO_URI"],
+        os.environ.get("NEO4J_ZOTERO_USER", "neo4j"),
+        os.environ["NEO4J_ZOTERO_PASSWORD"],
+    )
+    try:
+        with ne.driver.session() as s:
+            id_to_title = {r["id"]: r["title"] for r in s.run(
+                "MATCH (e:ExternalRef) WHERE e.id IN $ids RETURN e.id AS id, e.title AS title",
+                ids=[r[0] for r in rows]
+            ).data()}
+    finally:
+        ne.close()
+    print(f"=== pending_review ({len(rows)} rows; sorted by title_sim DESC) ===")
+    for ref_id, cr_doi, cr_score, sim, cr_title in rows:
+        orig = (id_to_title.get(ref_id) or "?")[:100]
+        cr   = (cr_title or "")[:100]
+        print(f"\n  {ref_id}  sim={sim:.2f} cr_score={cr_score:.0f}")
+        print(f"    ORIG: {orig}")
+        print(f"    CR  : {cr}")
+        print(f"    DOI : {cr_doi}")
+    print(f"\nReview then: python {sys.argv[0]} --approve <ref_id>   or   --reject <ref_id>")
+
+
+def cmd_approve(ref_id: str) -> None:
+    """Commit the pending CrossRef DOI to Neo4j + build SAME_WORK_AS + mark done."""
+    conn = _init_progress_db()
+    row = conn.execute(
+        "SELECT crossref_doi, crossref_title FROM crossref_progress "
+        "WHERE ref_id=? AND status='pending_review'",
+        (ref_id,),
+    ).fetchone()
+    if not row:
+        print(f"(ref_id {ref_id} not in pending_review — nothing to do)")
+        conn.close()
+        return
+    cr_doi, cr_title = row
+    ne = Neo4jWriter(
+        os.environ["NEO4J_ZOTERO_URI"],
+        os.environ.get("NEO4J_ZOTERO_USER", "neo4j"),
+        os.environ["NEO4J_ZOTERO_PASSWORD"],
+    )
+    try:
+        with ne.driver.session() as s:
+            s.run(
+                "MATCH (e:ExternalRef {id: $rid}) SET e.doi = $doi, e.crossref_title = $ct",
+                rid=ref_id, doi=cr_doi, ct=cr_title,
+            )
+        ne._link_same_work_as(ref_id)
+    finally:
+        ne.close()
+    _mark(conn, ref_id, "done",
+          doi=cr_doi,
+          attempts=_get_attempts(conn, ref_id) + 1,
+          last_err="approved_manually")
+    conn.close()
+    print(f"approved {ref_id} → doi={cr_doi}")
+
+
+def cmd_reject(ref_id: str) -> None:
+    """Mark pending_review as no_match (no DOI set; ref stays candidate-free)."""
+    conn = _init_progress_db()
+    row = conn.execute(
+        "SELECT status FROM crossref_progress WHERE ref_id=?", (ref_id,),
+    ).fetchone()
+    if not row or row[0] != "pending_review":
+        print(f"(ref_id {ref_id} not pending_review; current status={row[0] if row else 'missing'})")
+        conn.close()
+        return
+    _mark(conn, ref_id, "no_match",
+          attempts=_get_attempts(conn, ref_id) + 1,
+          last_err="rejected_manually")
+    conn.close()
+    print(f"rejected {ref_id}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, default=None,
@@ -438,7 +531,23 @@ def main():
                     help="Title similarity threshold for pending_review (default 0.25)")
     ap.add_argument("--workers", type=int, default=1,
                     help="Concurrent workers (max 3 per CrossRef polite pool limit)")
+    # Pending-review triage commands (mutually exclusive with the main run)
+    ap.add_argument("--list-pending", action="store_true",
+                    help="Print all pending_review rows (no enrichment run)")
+    ap.add_argument("--approve", metavar="REF_ID",
+                    help="Accept pending candidate: write DOI + SAME_WORK_AS, mark done")
+    ap.add_argument("--reject", metavar="REF_ID",
+                    help="Reject pending candidate: mark no_match (no Neo4j change)")
     args = ap.parse_args()
+
+    # Triage commands short-circuit; they don't invoke the main enrichment loop.
+    if args.list_pending:
+        return cmd_list_pending(args)
+    if args.approve:
+        return cmd_approve(args.approve)
+    if args.reject:
+        return cmd_reject(args.reject)
+
     if args.workers > 3:
         logger.warning("clamping workers to 3 (CrossRef X-Concurrency-Limit)")
         args.workers = 3

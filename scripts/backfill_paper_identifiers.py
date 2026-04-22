@@ -61,6 +61,7 @@ def _init_progress_db() -> sqlite3.Connection:
     PROGRESS_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(PROGRESS_DB))
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS paper_progress (
             paper_id    TEXT PRIMARY KEY,

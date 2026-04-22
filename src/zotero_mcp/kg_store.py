@@ -623,6 +623,7 @@ class Neo4jWriter:
                   ON CREATE SET r.kind_sources = ['doi'],
                                 r.kind = CASE
                                   WHEN 'ExternalRef' IN labels(other) THEN 'preprint-published-ref'
+                                  WHEN toLower(p.doi) STARTS WITH '10.48550/arxiv' THEN 'arxiv-alias'
                                   ELSE 'preprint-published'
                                 END,
                                 r.created_at = timestamp()
