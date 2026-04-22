@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -230,6 +231,144 @@ def convert_pdf_mineru(
     return md
 
 
+def convert_pdf_mineru_cloud_with_images(
+    pdf_path: str | Path,
+    *,
+    token: str | None = None,
+    lang: str = "en",
+    model_version: str = "vlm",
+    poll_interval: int = 3,
+    total_timeout: int = 600,
+) -> tuple[str, dict[str, bytes]]:
+    """Convert via MinerU Cloud API (https://mineru.net/api/v4).
+
+    Five-step protocol (signed upload, async job, CDN result):
+      1. POST /file-urls/batch  → get ``batch_id`` + Ali-OSS presigned PUT URL
+      2. ``requests.put(url, data=bytes)`` — CRITICAL to use requests and
+         NOT urllib: urllib auto-adds ``Content-Type`` which changes the
+         OSS canonical-string and triggers ``SignatureDoesNotMatch``.
+      3. Poll ``GET /extract-results/batch/{batch_id}`` every ``poll_interval``
+         seconds until ``state`` ∈ {done, failed} or ``total_timeout`` hit.
+      4. On ``done``: download ``full_zip_url`` (CDN at cdn-mineru.openxlab.org.cn).
+      5. Extract ``full.md`` + ``images/<sha>.jpg`` to match the same output
+         shape as ``convert_pdf_mineru_api_with_images`` (key = filename
+         including extension, value = raw bytes; MinerU uses 64-hex content
+         hash as filename, identical to self-hosted API).
+
+    Returns ``(md, images_dict)``. Raises RuntimeError on auth/quota/upload
+    failures so caller can fall through to next tier (CLI).
+
+    Quota: 2000 pages/day at highest priority per MinerU account, then
+    degraded (not hard-capped). Use this tier when self-hosted API is
+    unavailable (laptop, no GPU, no 3-5GB model on disk).
+    """
+    import io as _io
+    import requests
+    import zipfile as _zipfile
+
+    token = token or os.environ.get("MINERU_CLOUD_TOKEN", "")
+    if not token:
+        raise RuntimeError("MINERU_CLOUD_TOKEN env var not set")
+
+    pdf = Path(pdf_path).expanduser().resolve()
+    if not pdf.is_file():
+        raise FileNotFoundError(str(pdf))
+    pdf_bytes = pdf.read_bytes()
+
+    hdr_auth = {"Authorization": f"Bearer {token}"}
+    api_base = "https://mineru.net/api/v4"
+
+    # Step 1: request signed upload URL
+    t_start = time.time()
+    try:
+        resp = requests.post(
+            f"{api_base}/file-urls/batch",
+            json={
+                "enable_formula": True,
+                "enable_table": True,
+                "language": lang,
+                "files": [{"name": pdf.name, "is_ocr": False,
+                            "data_id": pdf.stem}],
+                "model_version": model_version,
+            },
+            headers=hdr_auth, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"mineru cloud: /file-urls/batch failed: {e}") from e
+
+    if data.get("code") != 0:
+        raise RuntimeError(f"mineru cloud: file-urls batch rejected: {data}")
+    inner = data.get("data", {})
+    batch_id = inner.get("batch_id")
+    file_urls = inner.get("file_urls", [])
+    if not batch_id or not file_urls:
+        raise RuntimeError(f"mineru cloud: malformed response: {inner}")
+    upload_url = file_urls[0]
+
+    # Step 2: PUT bytes to OSS presigned URL (NO Content-Type header)
+    try:
+        put_resp = requests.put(upload_url, data=pdf_bytes, timeout=120)
+        put_resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"mineru cloud: OSS upload failed: {e}") from e
+
+    # Step 3: poll status
+    result_url: str | None = None
+    state = "pending"
+    while state not in ("done", "failed"):
+        if time.time() - t_start > total_timeout:
+            raise RuntimeError(
+                f"mineru cloud: poll timeout after {total_timeout}s "
+                f"(last state={state})")
+        time.sleep(poll_interval)
+        try:
+            poll_resp = requests.get(
+                f"{api_base}/extract-results/batch/{batch_id}",
+                headers=hdr_auth, timeout=30,
+            )
+            poll_resp.raise_for_status()
+            poll = poll_resp.json()
+        except Exception as e:
+            logger.debug("mineru cloud: poll transient err (%s), retrying", e)
+            continue
+        er = (poll.get("data", {}).get("extract_result") or [{}])[0]
+        state = er.get("state", "unknown")
+        if state == "failed":
+            raise RuntimeError(
+                f"mineru cloud: parse failed: {er.get('err_msg','')}")
+        if state == "done":
+            result_url = er.get("full_zip_url")
+            break
+
+    if not result_url:
+        raise RuntimeError("mineru cloud: no full_zip_url in done state")
+
+    # Step 4-5: download zip + extract md + images
+    try:
+        zr = requests.get(result_url, timeout=120)
+        zr.raise_for_status()
+        zbytes = zr.content
+    except Exception as e:
+        raise RuntimeError(f"mineru cloud: result zip download failed: {e}") from e
+
+    md_text = ""
+    images: dict[str, bytes] = {}
+    with _zipfile.ZipFile(_io.BytesIO(zbytes)) as zf:
+        for name in zf.namelist():
+            if name == "full.md":
+                md_text = zf.read(name).decode("utf-8", errors="replace")
+            elif name.startswith("images/") and not name.endswith("/"):
+                # Strip "images/" prefix → match self-hosted API's key format
+                # (filename with extension, no directory)
+                fname = name.split("/", 1)[1]
+                images[fname] = zf.read(name)
+    if not md_text:
+        raise RuntimeError("mineru cloud: zip missing full.md")
+    return md_text, images
+
+
 def convert_pdf_mineru_with_images(
     pdf_path: str | Path,
     *,
@@ -239,14 +378,22 @@ def convert_pdf_mineru_with_images(
     timeout: int = 600,
     want_images: bool = True,
 ) -> tuple[str, dict[str, bytes]]:
-    """Convert + optionally return images.
+    """Convert + optionally return images. Three-tier fallback:
 
-    API mode is preferred; on failure falls back to CLI. When ``want_images``
-    is False the returned images dict is empty (parity with legacy md-only
-    callers). The CLI fallback scans ``<out_dir>/.../images/*.jpg`` within the
-    ``TemporaryDirectory`` context so bytes are read out before the dir is
-    auto-deleted on context exit.
+        Tier 1  self-hosted mineru-api (fastest ~2-26s, MINERU_API_URL set)
+        Tier 2  MinerU Cloud API (~60-120s, laptop-friendly,
+                MINERU_CLOUD_TOKEN set; 2000 pages/day high-priority quota)
+        Tier 3  local CLI (~40-60s cold load, needs 3-5GB model)
+
+    Each tier skipped silently when its trigger env var is missing. A tier
+    that fires but errors falls through to the next. When ``want_images`` is
+    False, the returned images dict is empty (parity with legacy md-only
+    callers) — but Tier 2 always fetches images (cost is negligible
+    compared to the ~100s total), and we just don't return them.
     """
+    errors: list[str] = []
+
+    # Tier 1: self-hosted mineru-api daemon
     if os.environ.get("MINERU_API_URL"):
         try:
             if want_images:
@@ -257,8 +404,23 @@ def convert_pdf_mineru_with_images(
                 pdf_path, backend=backend, lang=lang, timeout=timeout,
             ), {}
         except Exception as e:
-            logger.warning("mineru-api failed, falling back to CLI: %s", e)
+            errors.append(f"mineru-api: {e}")
+            logger.warning("mineru Tier 1 (self-hosted) failed: %s", e)
 
+    # Tier 2: MinerU Cloud API
+    if os.environ.get("MINERU_CLOUD_TOKEN"):
+        try:
+            md, images = convert_pdf_mineru_cloud_with_images(
+                pdf_path, lang=("en" if lang in ("en","ch") else lang),
+                total_timeout=timeout,
+            )
+            return (md, images if want_images else {})
+        except Exception as e:
+            errors.append(f"mineru-cloud: {e}")
+            logger.warning("mineru Tier 2 (cloud) failed: %s", e)
+
+    # Tier 3: local CLI
+    logger.info("mineru Tier 3 (CLI fallback) — this is slow (model cold-load)")
     pdf = Path(pdf_path).expanduser().resolve()
     if not pdf.is_file():
         raise FileNotFoundError(str(pdf))
