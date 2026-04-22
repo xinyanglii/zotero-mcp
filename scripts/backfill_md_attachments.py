@@ -90,10 +90,37 @@ def _z_req(method, path, body=None, extra_headers=None):
     return None
 
 
-def _wd_put(url, data):
+def _wd_put(url, data, max_attempts=4):
     req = urllib.request.Request(url, data=data, method="PUT",
                                   headers={"Authorization": _webdav_auth()})
-    urllib.request.urlopen(req, timeout=60).read()
+    delay = 5.0
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            urllib.request.urlopen(req, timeout=60).read()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 429) or 500 <= e.code < 600:
+                last_err = e
+                ra = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    sleep_s = int(ra) if ra else delay
+                except ValueError:
+                    sleep_s = delay
+                sleep_s = min(sleep_s, 40)
+                logger.warning("webdav put %d on %d/%d — sleeping %.1fs",
+                               e.code, attempt, max_attempts, sleep_s)
+                time.sleep(sleep_s)
+                delay = min(delay * 2, 40)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            logger.warning("webdav put transport err %d/%d (%s) sleep %.1fs",
+                           attempt, max_attempts, type(e).__name__, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 40)
+    raise RuntimeError(f"webdav put unavailable after {max_attempts}: {last_err!r}")
 
 
 def parent_has_tag(parent_key: str, tag: str) -> bool:
