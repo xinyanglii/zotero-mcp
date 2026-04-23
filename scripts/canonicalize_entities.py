@@ -32,6 +32,8 @@ Design decisions live in the spec file. Key invariants:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import itertools
 import json
 import logging
 import os
@@ -374,18 +376,20 @@ def find_similar_pairs(embeddings: np.ndarray, threshold: float,
 
 
 # ---------------------------------------------------------------------------
-# LLM judge
+# LLM judge — multi-provider concurrent dispatch
+#
+# Kimi (Anthropic-compat messages API) and Z.AI GLM (OpenAI-compat chat
+# completions) run in parallel via ThreadPoolExecutor. Provider assignment
+# is round-robin from ``T2_PROVIDERS`` env (default ``kimi,zai``); failures
+# are stored as ``judge_err:...`` verdicts and retried on the next rerun
+# (see ``get_cached_judge`` prefix filter).
 # ---------------------------------------------------------------------------
-def llm_judge(kimi_key: str,
-              node_a: tuple[str, str, str, int],
-              node_b: tuple[str, str, str, int],
-              cosine: float) -> dict:
-    """Ask kimi-for-coding whether two entity nodes refer to the same thing.
-    Returns {"same_entity": bool, "reason": str, "model": str}.
-    """
+def _build_judge_prompt(node_a: tuple[str, str, str, int],
+                        node_b: tuple[str, str, str, int],
+                        cosine: float) -> str:
     a_id, a_name, a_canon, a_deg = node_a
     b_id, b_name, b_canon, b_deg = node_b
-    prompt = (
+    return (
         "You are judging whether two knowledge-graph entity nodes refer "
         "to the same real-world concept / method / dataset. Respond with "
         "strict JSON only: {\"same_entity\": true|false, \"reason\": \"...\"}.\n\n"
@@ -402,16 +406,35 @@ def llm_judge(kimi_key: str,
         "  vs 'Encoder-only Transformer').\n"
         "Output ONLY the JSON object, no other text."
     )
+
+
+def _strip_json_fences(text: str) -> str:
+    return re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+
+
+def _llm_judge_kimi(node_a: tuple[str, str, str, int],
+                    node_b: tuple[str, str, str, int],
+                    cosine: float) -> dict:
+    """Kimi coding subscription — Anthropic-compat /v1/messages.
+
+    Kimi is a non-reasoning model; 300 tokens is plenty for the strict-JSON
+    verdict. Override via ``KIMI_JUDGE_MAX_TOKENS`` if needed.
+    """
+    key = os.getenv("KIMI_API_KEY") or ""
+    model = os.getenv("KIMI_JUDGE_MODEL", "kimi-for-coding")
+    url = os.getenv("KIMI_JUDGE_URL", "https://api.kimi.com/coding/v1/messages")
+    max_tokens = int(os.getenv("KIMI_JUDGE_MAX_TOKENS", "300"))
+    prompt = _build_judge_prompt(node_a, node_b, cosine)
     payload = json.dumps({
-        "model": "kimi-for-coding",
-        "max_tokens": 300,
+        "model": model,
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
-        "https://api.kimi.com/coding/v1/messages",
+        url,
         data=payload,
         headers={
-            "x-api-key": kimi_key,
+            "x-api-key": key,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
         },
@@ -420,18 +443,115 @@ def llm_judge(kimi_key: str,
         with urllib.request.urlopen(req, timeout=60) as r:
             resp = json.loads(r.read())
         text = resp["content"][0]["text"].strip()
-        # Defensive: strip fences if kimi emits ```json...```
-        text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
-        j = json.loads(text)
+        j = json.loads(_strip_json_fences(text))
         return {
             "same_entity": bool(j.get("same_entity", False)),
             "reason": str(j.get("reason", ""))[:500],
-            "model": "kimi-for-coding",
+            "model": model,
         }
     except Exception as e:
         return {"same_entity": False,
                 "reason": f"judge_err:{type(e).__name__}:{e}"[:500],
-                "model": "kimi-for-coding"}
+                "model": model}
+
+
+def _llm_judge_zai(node_a: tuple[str, str, str, int],
+                   node_b: tuple[str, str, str, int],
+                   cosine: float) -> dict:
+    """Z.AI coding plan — OpenAI-compat /v4/chat/completions.
+
+    glm-5.x are **reasoning models**: a significant portion of
+    ``max_tokens`` is spent on ``reasoning_content`` before the final
+    JSON is written to ``message.content``. Empirical probe 2026-04-23
+    showed max_tokens=200 left only 3 tokens for content → truncated
+    JSON → JSONDecodeError. 4000 tokens budget lets reasoning (~250
+    tokens) + JSON verdict fit comfortably. Override via
+    ``ZAI_JUDGE_MAX_TOKENS``.
+    """
+    key = os.getenv("Z_AI_API_KEY") or os.getenv("ZAI_API_KEY") or ""
+    model = os.getenv("ZAI_JUDGE_MODEL", "glm-5.1")
+    url = os.getenv(
+        "ZAI_JUDGE_URL",
+        "https://api.z.ai/api/coding/paas/v4/chat/completions",
+    )
+    max_tokens = int(os.getenv("ZAI_JUDGE_MAX_TOKENS", "4000"))
+    prompt = _build_judge_prompt(node_a, node_b, cosine)
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read())
+        text = resp["choices"][0]["message"]["content"].strip()
+        j = json.loads(_strip_json_fences(text))
+        return {
+            "same_entity": bool(j.get("same_entity", False)),
+            "reason": str(j.get("reason", ""))[:500],
+            "model": model,
+        }
+    except Exception as e:
+        return {"same_entity": False,
+                "reason": f"judge_err:{type(e).__name__}:{e}"[:500],
+                "model": model}
+
+
+_PROVIDERS_IMPL: dict = {
+    "kimi": _llm_judge_kimi,
+    "zai": _llm_judge_zai,
+}
+_provider_counter = itertools.count()
+
+
+def _provider_list() -> list[str]:
+    # ``os.getenv(name, default)`` only uses the default for unset vars;
+    # explicit empty string still returns "". Normalise via ``or`` so an
+    # empty env yields the default pair, not a crash-inducing empty list.
+    raw = os.getenv("T2_PROVIDERS") or "kimi,zai"
+    chosen = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    valid = [p for p in chosen if p in _PROVIDERS_IMPL]
+    return valid or ["kimi"]
+
+
+def _pick_provider(providers: list[str]) -> str:
+    """Thread-safe round-robin pick — ``itertools.count().__next__`` is
+    atomic (CPython GIL)."""
+    return providers[next(_provider_counter) % len(providers)]
+
+
+def _dispatch_judge(node_a: tuple[str, str, str, int],
+                    node_b: tuple[str, str, str, int],
+                    cosine: float,
+                    provider: str) -> dict:
+    fn = _PROVIDERS_IMPL.get(provider)
+    if fn is None:
+        return {"same_entity": False,
+                "reason": f"judge_err:unknown_provider:{provider}",
+                "model": provider}
+    return fn(node_a, node_b, cosine)
+
+
+def llm_judge(kimi_key: str,
+              node_a: tuple[str, str, str, int],
+              node_b: tuple[str, str, str, int],
+              cosine: float) -> dict:
+    """Legacy single-provider shim (Kimi). Kept for backward compatibility
+    with any caller that still passes ``kimi_key`` positionally. ``kimi_key``
+    is ignored — provider impls read from env directly. Routes through the
+    same dispatcher as the concurrent path so monkeypatches on
+    ``_PROVIDERS_IMPL`` (tests, future fault-injection) apply uniformly.
+    """
+    del kimi_key  # read from env inside provider impl
+    return _dispatch_judge(node_a, node_b, cosine, "kimi")
 
 
 # ---------------------------------------------------------------------------
@@ -570,13 +690,19 @@ def process_label(label: str, conn, ne: Neo4jWriter,
     stats[f"{label}_candidate_pairs"] = len(sim_pairs)
     logger.info("  candidate pairs cos>=%.2f: %d", TH_AMBIG, len(sim_pairs))
 
-    # Step 4: classify each candidate + maybe LLM judge + write edge
+    # Step 4: classify candidates; LLM-judge gray zone concurrently; write
+    # SAME_AS edges for accepts. Three phases share one Neo4j session + one
+    # sqlite conn (both non-thread-safe): scanning + Neo4j writes + sqlite
+    # writes all run on the main thread; only the LLM network I/O is fanned
+    # out to a ThreadPoolExecutor.
+    del kimi_key  # legacy param; provider impls read keys from env directly
     judged = 0
     judged_from_cache = 0
     auto = 0
     rejected = 0
     hub_forced_judge = 0
     errors = 0
+    judged_by: dict[str, int] = {p: 0 for p in _PROVIDERS_IMPL}
 
     # Unified list: (i, j, cos, kind) — exact first, then sim
     all_pairs: list[tuple[int, int, float, str]] = []
@@ -585,72 +711,112 @@ def process_label(label: str, conn, ne: Neo4jWriter,
     for i, j, cos in sim_pairs:
         all_pairs.append((i, j, cos, "sim"))
 
+    # Phase A (single-thread): classify every pair. Populate:
+    #   immediate_writes — exact + embed_auto + cache_hit_accept
+    #   needs_llm        — gray zone, no cache, real LLM call required
+    immediate_writes: list[tuple[str, tuple, tuple, float, str]] = []
+    needs_llm: list[tuple[str, tuple, tuple, float]] = []
     for i, j, cos, kind in all_pairs:
         node_a, node_b = nodes[i], nodes[j]
         pk = pair_key(node_a[0], node_b[0])
         if was_edge_written(conn, pk):
-            continue   # idempotent
+            continue
 
-        # Decide action
         if kind == "exact":
-            action = "write"
-            src_tag = "exact_match"
-        else:
-            # Adjust threshold if CJK or hub
-            cjk = _has_cjk(node_a[1]) or _has_cjk(node_b[1])
-            th_auto = TH_AUTO_CJK if cjk else TH_AUTO
-            hub = node_a[3] > HUB_DEGREE or node_b[3] > HUB_DEGREE
-            if cos >= th_auto and not hub:
-                action, src_tag = "write", "embed_auto"
-            elif cos >= TH_AMBIG:
-                if hub and cos >= th_auto:
-                    hub_forced_judge += 1
-                if dry_run:
-                    # Skip judge in dry run; just count as pending
-                    stats[f"{label}_dryrun_judge_skipped"] = \
-                        stats.get(f"{label}_dryrun_judge_skipped", 0) + 1
-                    continue
-                # LLM judge — check cache first (prior verdicts are stable
-                # across reruns; ``judge_err:`` rows skipped by helper).
-                cached = get_cached_judge(conn, pk)
-                if cached is not None:
-                    verdict = cached
-                    judged_from_cache += 1
+            immediate_writes.append((pk, node_a, node_b, cos, "exact_match"))
+            continue
+
+        cjk = _has_cjk(node_a[1]) or _has_cjk(node_b[1])
+        th_auto = TH_AUTO_CJK if cjk else TH_AUTO
+        hub = node_a[3] > HUB_DEGREE or node_b[3] > HUB_DEGREE
+
+        if cos >= th_auto and not hub:
+            immediate_writes.append((pk, node_a, node_b, cos, "embed_auto"))
+        elif cos >= TH_AMBIG:
+            if hub and cos >= th_auto:
+                hub_forced_judge += 1
+            if dry_run:
+                stats[f"{label}_dryrun_judge_skipped"] = \
+                    stats.get(f"{label}_dryrun_judge_skipped", 0) + 1
+                continue
+            cached = get_cached_judge(conn, pk)
+            if cached is not None:
+                judged_from_cache += 1
+                if cached["same_entity"]:
+                    immediate_writes.append(
+                        (pk, node_a, node_b, cos, "llm_judge"))
                 else:
-                    verdict = llm_judge(kimi_key, node_a, node_b, cos)
-                    judged += 1
-                    with conn:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO t2_llm_judge "
-                            "(pair_key, label_a, label_b, cosine, same_entity, "
-                            " reason, model, judged_at) VALUES (?,?,?,?,?,?,?,?)",
-                            (pk, label, label, cos,
-                             int(verdict["same_entity"]), verdict["reason"],
-                             verdict["model"], time.time()),
-                        )
-                if verdict["same_entity"]:
-                    action, src_tag = "write", "llm_judge"
-                else:
-                    action, src_tag = "skip", None
                     rejected += 1
             else:
-                action = "skip"
-                src_tag = None
+                needs_llm.append((pk, node_a, node_b, cos))
+        # else: cos < TH_AMBIG → skip silently (same as v1 behaviour)
 
-        if action == "write":
-            if dry_run:
-                stats[f"{label}_dryrun_would_write"] = \
-                    stats.get(f"{label}_dryrun_would_write", 0) + 1
-                continue
-            try:
-                write_same_as(ne, label, node_a[0], node_b[0],
-                                cos, src_tag, EMBED_MODEL)
-                log_edge_written(conn, pk, src_tag)
-                auto += 1
-            except Exception as e:
-                errors += 1
-                logger.warning("neo4j err on pair %s: %s", pk, e)
-                _record_failure(conn, "neo4j_merge", pk, str(e))
+    # Phase B (single-thread): flush immediate writes to Neo4j.
+    def _write_edge(pk, node_a, node_b, cos, src_tag):
+        nonlocal auto, errors
+        if dry_run:
+            stats[f"{label}_dryrun_would_write"] = \
+                stats.get(f"{label}_dryrun_would_write", 0) + 1
+            return
+        try:
+            write_same_as(ne, label, node_a[0], node_b[0],
+                          cos, src_tag, EMBED_MODEL)
+            log_edge_written(conn, pk, src_tag)
+            auto += 1
+        except Exception as e:
+            errors += 1
+            logger.warning("neo4j err on pair %s: %s", pk, e)
+            _record_failure(conn, "neo4j_merge", pk, str(e))
+
+    for pk, node_a, node_b, cos, src_tag in immediate_writes:
+        _write_edge(pk, node_a, node_b, cos, src_tag)
+
+    # Phase C (concurrent): LLM judges for gray-zone pairs with no cached
+    # verdict. Workers are pure — they do only the network call and return
+    # a verdict dict. The main thread owns all sqlite + Neo4j mutations.
+    if needs_llm and not dry_run:
+        providers = _provider_list()
+        max_workers = max(1, int(os.getenv("T2_WORKERS", "4")))
+        logger.info(
+            "  LLM judge: %d pending, workers=%d, providers=%s",
+            len(needs_llm), max_workers, ",".join(providers),
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max_workers) as ex:
+            futures: dict = {}
+            for pk, node_a, node_b, cos in needs_llm:
+                provider = _pick_provider(providers)
+                fut = ex.submit(
+                    _dispatch_judge, node_a, node_b, cos, provider)
+                futures[fut] = (pk, node_a, node_b, cos, provider)
+
+            # Phase D (main thread): consume verdicts, persist, write edges.
+            for fut in concurrent.futures.as_completed(futures):
+                pk, node_a, node_b, cos, provider = futures[fut]
+                try:
+                    verdict = fut.result()
+                except Exception as e:
+                    verdict = {
+                        "same_entity": False,
+                        "reason": f"judge_err:worker_exception:"
+                                  f"{type(e).__name__}:{e}"[:500],
+                        "model": provider,
+                    }
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO t2_llm_judge "
+                        "(pair_key, label_a, label_b, cosine, same_entity, "
+                        " reason, model, judged_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (pk, label, label, cos,
+                         int(verdict["same_entity"]), verdict["reason"],
+                         verdict["model"], time.time()),
+                    )
+                judged += 1
+                judged_by[provider] = judged_by.get(provider, 0) + 1
+                if verdict["same_entity"]:
+                    _write_edge(pk, node_a, node_b, cos, "llm_judge")
+                else:
+                    rejected += 1
 
     stats[f"{label}_edges_written"] = auto
     stats[f"{label}_llm_judged"] = judged
@@ -658,10 +824,15 @@ def process_label(label: str, conn, ne: Neo4jWriter,
     stats[f"{label}_llm_rejected"] = rejected
     stats[f"{label}_hub_forced_judge"] = hub_forced_judge
     stats[f"{label}_errors"] = errors
+    for _p, _n in judged_by.items():
+        stats[f"{label}_llm_judged_by_{_p}"] = _n
+    by_str = " / ".join(f"{_p}={_n}" for _p, _n in judged_by.items() if _n) \
+        or "—"
     logger.info(
         "  done: wrote %d / judged %d (+%d from cache) / rejected %d / "
-        "hub-judge %d / err %d",
-        auto, judged, judged_from_cache, rejected, hub_forced_judge, errors,
+        "hub-judge %d / err %d / by: %s",
+        auto, judged, judged_from_cache, rejected, hub_forced_judge,
+        errors, by_str,
     )
 
 
