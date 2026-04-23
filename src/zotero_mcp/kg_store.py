@@ -498,6 +498,68 @@ def _label_hierarchy(item_type: str) -> tuple[str, str]:
 _ALLOWED_SUB_LABELS = frozenset({"Paper", "Webpage", "CodeRepo", "Unknown"})
 
 
+# --- T5 L4 · title_hash fuzzy dedup helpers ------------------------------
+# Designed to catch preprint ↔ published same-paper pairs that L3 misses
+# (when DOI is absent on the preprint and arxiv_id is absent on the
+# published version). Pure module-level functions — stable input → stable
+# hash, so backfill + live ingest compute identical values.
+#
+# Known limitation: year is included in the hash, so a preprint posted
+# 2024 and published in 2025 with DOI/arxiv both missing will NOT link.
+# Accepted (see plans/zkg-t5-l4-title-hash-spec.md §Open Questions). If
+# this becomes a common case, either drop year from the hash or bucket
+# it (year // 2 * 2).
+
+def _normalize_title(raw: str) -> str:
+    """Case-insensitive, punctuation-stripped, whitespace-collapsed title.
+    NFKC normalisation + strip common preprint suffixes first so typographic
+    drift (smart-quotes, em-dashes, trailing " (preprint)") doesn't create
+    divergent hashes for the same work. Preserves CJK characters."""
+    import unicodedata as _ud
+    s = _ud.normalize("NFKC", raw).lower().strip()
+    for suffix in (" (preprint)", " [preprint]", " - arxiv",
+                   ": arxiv preprint"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    s = re.sub(r"[^\w一-鿿\s]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_author(last: str) -> str:
+    """First-author lastname: lowercased, punctuation/whitespace-stripped,
+    CJK preserved. Used in title_hash — lossy by design (drops spacing
+    between e.g. 'van der X' forms so the hash is stable across citation
+    formatting variants)."""
+    import unicodedata as _ud
+    s = _ud.normalize("NFKC", last).lower().strip()
+    s = re.sub(r"[^\w一-鿿]", "", s, flags=re.UNICODE)
+    return s
+
+
+def compute_title_hash(title: str | None,
+                       first_author_last: str | None,
+                       year: int | None) -> str | None:
+    """SHA-256 of 'norm_title||norm_author||year' — or None if the inputs
+    are too weak to dedup safely. Guards:
+      * title < 10 chars → None (1-word titles like "Attention" collide)
+      * first author missing → None (pure title+year carries too many
+        collisions across reports / talks)
+      * year None → uses "0" so records without year only dedup against
+        each other
+    Caller stores the returned string verbatim on the :Source node."""
+    if not title or len(title.strip()) < 10:
+        return None
+    if not first_author_last or not first_author_last.strip():
+        return None
+    norm_title = _normalize_title(title)
+    norm_author = _normalize_author(first_author_last)
+    if not norm_title or not norm_author:
+        return None
+    raw = f"{norm_title}||{norm_author}||{year if year else 0}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 class Neo4jWriter:
     # T1 schema indexes — created once per process. Idempotent via
     # ``CREATE INDEX ... IF NOT EXISTS``; safe to re-run.
@@ -513,6 +575,10 @@ class Neo4jWriter:
     _INDEXES_CYPHER = (
         "CREATE INDEX source_doi      IF NOT EXISTS FOR (s:Source) ON (s.doi)",
         "CREATE INDEX source_arxiv_id IF NOT EXISTS FOR (s:Source) ON (s.arxiv_id)",
+        # T5 L4 — index on :Source (not :Paper) to match _link_same_work_as
+        # entrypoint `MATCH (p:Source {id: $pid})`; multi-label `:Source:Paper`
+        # still uses this when title_hash lookup happens.
+        "CREATE INDEX source_title_hash IF NOT EXISTS FOR (s:Source) ON (s.title_hash)",
         "CREATE INDEX paper_id        IF NOT EXISTS FOR (p:Paper)  ON (p.id)",
     )
 
@@ -611,7 +677,7 @@ class Neo4jWriter:
         # the corresponding Paper node via SAME_WORK_AS. The DOI uniqueness
         # invariant carries through — there's no concern that we'd
         # accidentally link an unrelated Source.
-        counts = {"doi_links": 0, "arxiv_links": 0}
+        counts = {"doi_links": 0, "arxiv_links": 0, "title_hash_links": 0}
         with self.driver.session() as s:
             # DOI-driven linking
             res = s.run(
@@ -652,6 +718,26 @@ class Neo4jWriter:
                 pid=paper_id,
             )
             counts["arxiv_links"] = res.single()["n"]
+
+            # T5 L4 · title_hash-driven linking for preprint↔published pairs
+            # that slipped past DOI/arxiv match. Same MERGE direction + array-
+            # append idiom as the two blocks above.
+            res = s.run(
+                """
+                MATCH (p:Source {id: $pid}) WHERE p.title_hash IS NOT NULL
+                WITH p
+                MATCH (other:Source {title_hash: p.title_hash}) WHERE other.id <> p.id
+                MERGE (p)-[r:SAME_WORK_AS]->(other)
+                  ON CREATE SET r.kind_sources = ['title_hash'],
+                                r.kind = 'title-hash-fuzzy',
+                                r.created_at = timestamp()
+                  ON MATCH  SET r.kind_sources = apoc.coll.toSet(
+                                  coalesce(r.kind_sources, []) + ['title_hash'])
+                RETURN count(r) AS n
+                """,
+                pid=paper_id,
+            )
+            counts["title_hash_links"] = res.single()["n"]
         return counts
 
     def _write_paper_once(
@@ -664,6 +750,18 @@ class Neo4jWriter:
     ):
         doi = (ids or {}).get("doi")
         arxiv_id = (ids or {}).get("arxiv_id")
+        # T5 L4: compute title_hash from title + first-author lastname + year
+        # so L3-missed dedup cases (preprint/published pair where both lack
+        # one of the identifiers) get SAME_WORK_AS-linked via a third scan.
+        # Returns None for weak inputs; Neo4j SET with None clears/keeps null.
+        first_author_last = ""
+        for a in (authors or []):
+            name = (a.get("lastName") or a.get("name") or "").strip()
+            if name:
+                first_author_last = name
+                break
+        title_hash = compute_title_hash(paper.title, first_author_last,
+                                        paper.year)
         # T3: route to :Paper / :Webpage / :CodeRepo / :Unknown by itemType.
         # Sub-label is from closed set ``_ALLOWED_SUB_LABELS``; f-string
         # interpolation is injection-safe so long as the set stays closed.
@@ -685,11 +783,12 @@ class Neo4jWriter:
                         p.item_type = $item_type,
                         p.contribution_type = $ctype,
                         p.doi = $doi,
-                        p.arxiv_id = $arxiv_id""",
+                        p.arxiv_id = $arxiv_id,
+                        p.title_hash = $title_hash""",
                 pid=paper.paper_id, title=paper.title, year=paper.year,
                 tldr=paper.tldr, problem=paper.problem[:500],
                 item_type=item_type, ctype=paper.contribution_type,
-                doi=doi, arxiv_id=arxiv_id,
+                doi=doi, arxiv_id=arxiv_id, title_hash=title_hash,
             )
             # venue
             if paper.venue:
