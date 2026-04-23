@@ -488,6 +488,31 @@ def was_edge_written(conn, pk: str) -> bool:
     return r is not None
 
 
+def get_cached_judge(conn, pk: str) -> dict | None:
+    """Return prior LLM judge verdict for pair_key, or None if uncached /
+    unusable. Skips rows with reason prefixed ``judge_err:`` — those record
+    transient LLM-call failures (see ``llm_judge`` exception handler), not
+    real verdicts, so callers must retry.
+
+    The judge is keyed on pair_key only — stable across embed_model changes
+    because ``llm_judge`` decides on entity name / canonical (not embedding).
+    """
+    r = conn.execute(
+        "SELECT same_entity, reason, model FROM t2_llm_judge WHERE pair_key=?",
+        (pk,),
+    ).fetchone()
+    if r is None:
+        return None
+    same_entity, reason, model = r
+    if reason and str(reason).startswith("judge_err:"):
+        return None
+    return {
+        "same_entity": bool(same_entity),
+        "reason": str(reason) if reason is not None else "",
+        "model": str(model) if model is not None else "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dataset exact-match pre-pass (spec §8 finding 8)
 # ---------------------------------------------------------------------------
@@ -547,6 +572,7 @@ def process_label(label: str, conn, ne: Neo4jWriter,
 
     # Step 4: classify each candidate + maybe LLM judge + write edge
     judged = 0
+    judged_from_cache = 0
     auto = 0
     rejected = 0
     hub_forced_judge = 0
@@ -584,18 +610,24 @@ def process_label(label: str, conn, ne: Neo4jWriter,
                     stats[f"{label}_dryrun_judge_skipped"] = \
                         stats.get(f"{label}_dryrun_judge_skipped", 0) + 1
                     continue
-                # LLM judge
-                verdict = llm_judge(kimi_key, node_a, node_b, cos)
-                judged += 1
-                with conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO t2_llm_judge "
-                        "(pair_key, label_a, label_b, cosine, same_entity, "
-                        " reason, model, judged_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (pk, label, label, cos,
-                         int(verdict["same_entity"]), verdict["reason"],
-                         verdict["model"], time.time()),
-                    )
+                # LLM judge — check cache first (prior verdicts are stable
+                # across reruns; ``judge_err:`` rows skipped by helper).
+                cached = get_cached_judge(conn, pk)
+                if cached is not None:
+                    verdict = cached
+                    judged_from_cache += 1
+                else:
+                    verdict = llm_judge(kimi_key, node_a, node_b, cos)
+                    judged += 1
+                    with conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO t2_llm_judge "
+                            "(pair_key, label_a, label_b, cosine, same_entity, "
+                            " reason, model, judged_at) VALUES (?,?,?,?,?,?,?,?)",
+                            (pk, label, label, cos,
+                             int(verdict["same_entity"]), verdict["reason"],
+                             verdict["model"], time.time()),
+                        )
                 if verdict["same_entity"]:
                     action, src_tag = "write", "llm_judge"
                 else:
@@ -622,11 +654,15 @@ def process_label(label: str, conn, ne: Neo4jWriter,
 
     stats[f"{label}_edges_written"] = auto
     stats[f"{label}_llm_judged"] = judged
+    stats[f"{label}_llm_judged_from_cache"] = judged_from_cache
     stats[f"{label}_llm_rejected"] = rejected
     stats[f"{label}_hub_forced_judge"] = hub_forced_judge
     stats[f"{label}_errors"] = errors
-    logger.info("  done: wrote %d / judged %d / rejected %d / hub-judge %d / err %d",
-                auto, judged, rejected, hub_forced_judge, errors)
+    logger.info(
+        "  done: wrote %d / judged %d (+%d from cache) / rejected %d / "
+        "hub-judge %d / err %d",
+        auto, judged, judged_from_cache, rejected, hub_forced_judge, errors,
+    )
 
 
 def run(args) -> None:
