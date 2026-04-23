@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import itertools
 import json
 import logging
 import os
@@ -50,6 +49,12 @@ try:
     load_dotenv(os.path.expanduser("~/.claude/.env.local"), override=False)
 except ImportError:
     pass
+
+# unified_llm router — replaces the old _llm_judge_kimi/_zai urllib shims.
+_UL = os.path.expanduser("~/.claude/scripts")
+if _UL not in sys.path:
+    sys.path.insert(0, _UL)
+from unified_llm import call as _unified_call  # noqa: E402
 
 import numpy as np
 
@@ -412,146 +417,56 @@ def _strip_json_fences(text: str) -> str:
     return re.sub(r"^```(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
 
 
-def _llm_judge_kimi(node_a: tuple[str, str, str, int],
-                    node_b: tuple[str, str, str, int],
-                    cosine: float) -> dict:
-    """Kimi coding subscription — Anthropic-compat /v1/messages.
-
-    Kimi is a non-reasoning model; 300 tokens is plenty for the strict-JSON
-    verdict. Override via ``KIMI_JUDGE_MAX_TOKENS`` if needed.
-    """
-    key = os.getenv("KIMI_API_KEY") or ""
-    model = os.getenv("KIMI_JUDGE_MODEL", "kimi-for-coding")
-    url = os.getenv("KIMI_JUDGE_URL", "https://api.kimi.com/coding/v1/messages")
-    max_tokens = int(os.getenv("KIMI_JUDGE_MAX_TOKENS", "300"))
-    prompt = _build_judge_prompt(node_a, node_b, cosine)
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            resp = json.loads(r.read())
-        text = resp["content"][0]["text"].strip()
-        j = json.loads(_strip_json_fences(text))
-        return {
-            "same_entity": bool(j.get("same_entity", False)),
-            "reason": str(j.get("reason", ""))[:500],
-            "model": model,
-        }
-    except Exception as e:
-        return {"same_entity": False,
-                "reason": f"judge_err:{type(e).__name__}:{e}"[:500],
-                "model": model}
-
-
-def _llm_judge_zai(node_a: tuple[str, str, str, int],
-                   node_b: tuple[str, str, str, int],
-                   cosine: float) -> dict:
-    """Z.AI coding plan — OpenAI-compat /v4/chat/completions.
-
-    glm-5.x are **reasoning models**: a significant portion of
-    ``max_tokens`` is spent on ``reasoning_content`` before the final
-    JSON is written to ``message.content``. Empirical probe 2026-04-23
-    showed max_tokens=200 left only 3 tokens for content → truncated
-    JSON → JSONDecodeError. 4000 tokens budget lets reasoning (~250
-    tokens) + JSON verdict fit comfortably. Override via
-    ``ZAI_JUDGE_MAX_TOKENS``.
-    """
-    key = os.getenv("Z_AI_API_KEY") or os.getenv("ZAI_API_KEY") or ""
-    model = os.getenv("ZAI_JUDGE_MODEL", "glm-5.1")
-    url = os.getenv(
-        "ZAI_JUDGE_URL",
-        "https://api.z.ai/api/coding/paas/v4/chat/completions",
-    )
-    max_tokens = int(os.getenv("ZAI_JUDGE_MAX_TOKENS", "4000"))
-    prompt = _build_judge_prompt(node_a, node_b, cosine)
-    payload = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            resp = json.loads(r.read())
-        text = resp["choices"][0]["message"]["content"].strip()
-        j = json.loads(_strip_json_fences(text))
-        return {
-            "same_entity": bool(j.get("same_entity", False)),
-            "reason": str(j.get("reason", ""))[:500],
-            "model": model,
-        }
-    except Exception as e:
-        return {"same_entity": False,
-                "reason": f"judge_err:{type(e).__name__}:{e}"[:500],
-                "model": model}
-
-
-_PROVIDERS_IMPL: dict = {
-    "kimi": _llm_judge_kimi,
-    "zai": _llm_judge_zai,
-}
-_provider_counter = itertools.count()
-
-
-def _provider_list() -> list[str]:
-    # ``os.getenv(name, default)`` only uses the default for unset vars;
-    # explicit empty string still returns "". Normalise via ``or`` so an
-    # empty env yields the default pair, not a crash-inducing empty list.
-    raw = os.getenv("T2_PROVIDERS") or "kimi,zai"
-    chosen = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    valid = [p for p in chosen if p in _PROVIDERS_IMPL]
-    return valid or ["kimi"]
-
-
-def _pick_provider(providers: list[str]) -> str:
-    """Thread-safe round-robin pick — ``itertools.count().__next__`` is
-    atomic (CPython GIL)."""
-    return providers[next(_provider_counter) % len(providers)]
-
-
 def _dispatch_judge(node_a: tuple[str, str, str, int],
                     node_b: tuple[str, str, str, int],
-                    cosine: float,
-                    provider: str) -> dict:
-    fn = _PROVIDERS_IMPL.get(provider)
-    if fn is None:
-        return {"same_entity": False,
-                "reason": f"judge_err:unknown_provider:{provider}",
-                "model": provider}
-    return fn(node_a, node_b, cosine)
+                    cosine: float) -> dict:
+    """Route through unified_llm.call. Router handles weighted-random tier1
+    (Kimi 50% + GLM-5.1 50% for text), tier2 qwen-plus-latest paid fallback,
+    5-min cooldown on 429/5xx. The old manual round-robin + per-provider
+    urllib shims are gone; all that's left here is prompt assembly + JSON
+    parsing + dict shape mapping.
+
+    Returns the same verdict shape as before: ``{same_entity, reason,
+    model, provider}``. ``provider`` is populated from router response for
+    the ``judged_by[provider]`` stats in the caller loop.
+    """
+    prompt = _build_judge_prompt(node_a, node_b, cosine)
+    try:
+        resp = _unified_call(
+            [{"role": "user", "content": prompt}],
+            task="t2_entity_canonicalization",
+            modality="text",
+            # glm-5.1 is a reasoning model; 4000 is a safe ceiling for
+            # reasoning_content + JSON verdict. Router will pass it through.
+            max_tokens=4000,
+            temperature=0.0,
+        )
+        text = resp["text"].strip()
+        j = json.loads(_strip_json_fences(text))
+        return {
+            "same_entity": bool(j.get("same_entity", False)),
+            "reason": str(j.get("reason", ""))[:500],
+            "model": resp.get("model", ""),
+            "provider": resp.get("provider", ""),
+        }
+    except Exception as e:
+        return {
+            "same_entity": False,
+            "reason": f"judge_err:{type(e).__name__}:{e}"[:500],
+            "model": "",
+            "provider": "",
+        }
 
 
 def llm_judge(kimi_key: str,
               node_a: tuple[str, str, str, int],
               node_b: tuple[str, str, str, int],
               cosine: float) -> dict:
-    """Legacy single-provider shim (Kimi). Kept for backward compatibility
-    with any caller that still passes ``kimi_key`` positionally. ``kimi_key``
-    is ignored — provider impls read from env directly. Routes through the
-    same dispatcher as the concurrent path so monkeypatches on
-    ``_PROVIDERS_IMPL`` (tests, future fault-injection) apply uniformly.
-    """
-    del kimi_key  # read from env inside provider impl
-    return _dispatch_judge(node_a, node_b, cosine, "kimi")
+    """Legacy single-provider shim. ``kimi_key`` is ignored — unified_llm
+    reads provider keys from env directly, and the router picks the
+    provider (not this caller)."""
+    del kimi_key
+    return _dispatch_judge(node_a, node_b, cosine)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +617,10 @@ def process_label(label: str, conn, ne: Neo4jWriter,
     rejected = 0
     hub_forced_judge = 0
     errors = 0
-    judged_by: dict[str, int] = {p: 0 for p in _PROVIDERS_IMPL}
+    # Populated lazily as the router reports which provider handled each
+    # judge (previously pre-seeded from the old _PROVIDERS_IMPL dict; router
+    # owns provider selection now so we can't know the set up front).
+    judged_by: dict[str, int] = {}
 
     # Unified list: (i, j, cos, kind) — exact first, then sim
     all_pairs: list[tuple[int, int, float, str]] = []
@@ -775,24 +693,24 @@ def process_label(label: str, conn, ne: Neo4jWriter,
     # verdict. Workers are pure — they do only the network call and return
     # a verdict dict. The main thread owns all sqlite + Neo4j mutations.
     if needs_llm and not dry_run:
-        providers = _provider_list()
         max_workers = max(1, int(os.getenv("T2_WORKERS", "4")))
         logger.info(
-            "  LLM judge: %d pending, workers=%d, providers=%s",
-            len(needs_llm), max_workers, ",".join(providers),
+            "  LLM judge: %d pending, workers=%d "
+            "(provider routing handled by unified_llm)",
+            len(needs_llm), max_workers,
         )
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=max_workers) as ex:
             futures: dict = {}
             for pk, node_a, node_b, cos in needs_llm:
-                provider = _pick_provider(providers)
-                fut = ex.submit(
-                    _dispatch_judge, node_a, node_b, cos, provider)
-                futures[fut] = (pk, node_a, node_b, cos, provider)
+                # Router picks provider per-call (weighted random). Stats
+                # source comes back in verdict["provider"].
+                fut = ex.submit(_dispatch_judge, node_a, node_b, cos)
+                futures[fut] = (pk, node_a, node_b, cos)
 
             # Phase D (main thread): consume verdicts, persist, write edges.
             for fut in concurrent.futures.as_completed(futures):
-                pk, node_a, node_b, cos, provider = futures[fut]
+                pk, node_a, node_b, cos = futures[fut]
                 try:
                     verdict = fut.result()
                 except Exception as e:
@@ -800,7 +718,8 @@ def process_label(label: str, conn, ne: Neo4jWriter,
                         "same_entity": False,
                         "reason": f"judge_err:worker_exception:"
                                   f"{type(e).__name__}:{e}"[:500],
-                        "model": provider,
+                        "model": "",
+                        "provider": "worker_exc",
                     }
                 with conn:
                     conn.execute(
@@ -812,7 +731,8 @@ def process_label(label: str, conn, ne: Neo4jWriter,
                          verdict["model"], time.time()),
                     )
                 judged += 1
-                judged_by[provider] = judged_by.get(provider, 0) + 1
+                prov_stat = verdict.get("provider") or "unknown"
+                judged_by[prov_stat] = judged_by.get(prov_stat, 0) + 1
                 if verdict["same_entity"]:
                     _write_edge(pk, node_a, node_b, cos, "llm_judge")
                 else:
@@ -847,8 +767,14 @@ def run(args) -> None:
         logger.error("DASHSCOPE_API_KEY missing")
         sys.exit(2)
     kimi_key = os.environ.get("KIMI_API_KEY") or ""
-    if not kimi_key and not args.dry_run:
-        logger.error("KIMI_API_KEY missing (needed for LLM judge)")
+    zai_key = os.environ.get("Z_AI_API_KEY") or os.environ.get("ZAI_API_KEY") or ""
+    # Router routes to Kimi / GLM-5.1 / DashScope-qwen tiers — any one key is
+    # enough for non-dry-run. Previously hard-required KIMI; that over-gated
+    # runs where the router would have succeeded via GLM or the tier2 paid
+    # fallback alone.
+    if not args.dry_run and not (kimi_key or zai_key or dashscope_key):
+        logger.error("no LLM key present (need KIMI_API_KEY or Z_AI_API_KEY "
+                     "or DASHSCOPE_API_KEY for tier2 fallback)")
         sys.exit(2)
 
     ne = Neo4jWriter(
