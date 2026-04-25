@@ -417,6 +417,6 @@ def convert_to_markdown(file_path: str | Path) -> str:
     Dispatches via `parser_factory` so PDFs route to MinerU (academic-grade
     formula/table/layout fidelity) while non-PDFs continue to use markitdown.
     """
-    from .parser_factory import convert_to_markdown_smart
+    from zotero_kg.parser_factory import convert_to_markdown_smart
 
     return convert_to_markdown_smart(file_path)

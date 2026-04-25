@@ -1127,7 +1127,7 @@ def create_annotation(
         Confirmation message with the new annotation key
     """
 
-    from zotero_mcp.pdf_utils import (
+    from zotero_kg.pdf_utils import (
         find_text_position,
         get_page_label,
         build_annotation_position,
@@ -1415,7 +1415,7 @@ def create_area_annotation(
     """
     from math import isfinite
 
-    from zotero_mcp.pdf_utils import (
+    from zotero_kg.pdf_utils import (
         build_annotation_position,
         build_area_position_data,
         get_page_label,

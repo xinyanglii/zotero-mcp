@@ -50,7 +50,7 @@ def create_backend_client(config_path: str | None = None):
     backend = _resolve_backend(config)
 
     if backend == "qdrant":
-        from .qdrant_backend import create_qdrant_client
+        from zotero_kg.qdrant_backend import create_qdrant_client
         logger.info("Using Qdrant remote backend for semantic search")
         return create_qdrant_client(config)
 
