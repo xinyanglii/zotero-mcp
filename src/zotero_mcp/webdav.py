@@ -30,12 +30,34 @@ import io
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 import zipfile
 
 logger = logging.getLogger(__name__)
+
+
+# Jianguoyun paid plan: ≤1500 requests / 30min ≈ 0.83 QPS global.
+# 2026-04-24 incident: concurrent zkg (w=4) + batch-ingest (w=4) + 2nd zkg (w=2)
+# burst to ~20 QPS. Jianguoyun returned 503 for every request with the account's
+# BASIC auth; unauth'd PROPFIND to the same URL returned 401 cleanly, proving
+# it was account-level throttle, not 全站故障 as earlier memories recorded.
+# This limiter caps per-process rate; run at most 2 concurrent processes to
+# stay under the hard limit with margin.
+_RATE_LOCK = threading.Lock()
+_LAST_WEBDAV_CALL = [0.0]
+
+
+def _rate_limit_wait() -> None:
+    min_interval = float(os.environ.get("WEBDAV_MIN_INTERVAL_S", "3.0"))
+    with _RATE_LOCK:
+        now = time.monotonic()
+        wait = min_interval - (now - _LAST_WEBDAV_CALL[0])
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_WEBDAV_CALL[0] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +91,16 @@ def _retry_urlopen(req, timeout: int, max_attempts: int = 4):
     soft-throttle 403. 404 is surfaced unchanged. Final failure raises
     WebDAVOutageError so outer loops can circuit-break.
 
-    Defaults: 4 attempts with 5/10/20/40s backoff (~75s total). 503 is
-    usually a Jianguoyun backend flap, not account throttle — hammering
-    with more retries just wastes time. Circuit-breaker in ingest.py
-    catches persistent outage and pauses the whole pipeline."""
+    Defaults: 4 attempts with 5/10/20/40s backoff (~75s total). Each attempt
+    is gated by the per-process rate limiter (see _rate_limit_wait) so we
+    stay under Jianguoyun's 1500-req/30min ceiling — exceeding that returns
+    503 on every request for ~30min until the rolling window drains.
+    Circuit-breaker in ingest.py catches persistent outage and pauses the
+    whole pipeline."""
     delay = 5.0
     last_err: Exception | None = None
     for attempt in range(1, max_attempts + 1):
+        _rate_limit_wait()
         try:
             return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
@@ -291,6 +316,46 @@ def put_figure(
     with _retry_urlopen(req, timeout=timeout) as r:
         r.read()
     return rel_path
+
+
+def put_figures_zip(
+    paper_id: str, figures: list[dict], *,
+    timeout: int = 120,
+) -> dict[str, str]:
+    """Batch-upload ALL figures of one paper as a single zip.
+
+    Replaces 30-50 independent put_figure calls (each ~5-7s including network
+    upload + 1.5s rate limit) with one PUT of <paper_id>.zip containing
+    every figure under its mineru_name. Typical savings: 90%+ of wall-clock
+    WebDAV time per paper. See 2026-04-24 incident memo.
+
+    Returns {mineru_name: "<paper_id>.zip::<mineru_name>"} mapping, which
+    callers write into SQLite `figures.webdav_path`. The "::" separator
+    flags the entry as living inside a zip (vs the legacy independent-file
+    layout used by put_figure, which stays untouched).
+
+    Raises WebDAVOutageError on all-attempts-fail; all-or-nothing (no
+    partial upload — callers mark every figure pending and retry later).
+    """
+    import io
+    import zipfile
+    root = _ensure_figures_root()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for f in figures:
+            zf.writestr(f["mineru_name"], f["bytes_for_upload"])
+    zip_bytes = buf.getvalue()
+    rel = f"{paper_id}.zip"
+    url = f"{root}/{rel}"
+    headers = {
+        "Authorization": _auth_header(),
+        "Content-Type": "application/zip",
+        "Content-Length": str(len(zip_bytes)),
+    }
+    req = urllib.request.Request(url, data=zip_bytes, method="PUT", headers=headers)
+    with _retry_urlopen(req, timeout=timeout) as r:
+        r.read()
+    return {f["mineru_name"]: f"{rel}::{f['mineru_name']}" for f in figures}
 
 
 def delete_figure(paper_id: str, mineru_name: str, *, timeout: int = 30) -> None:
