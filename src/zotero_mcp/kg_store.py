@@ -77,7 +77,17 @@ class SQLiteStore:
       ON figures(paper_id) WHERE webdav_path IS NULL;
     """
 
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        qdrant_writer: "QdrantWriter | None" = None,
+    ):
+        # Optional Qdrant writer for cross-host provenance check. When set,
+        # ``already_done()`` first asks Qdrant whether this paper_id has any
+        # chunk; SQLite is fallback only. Lets a fresh host (or a re-clone)
+        # skip already-ingested papers without re-paying LLM extraction.
+        self._qdrant_writer = qdrant_writer
         self.path = Path(db_path).expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False so the ThreadPoolExecutor workers can share the
@@ -86,6 +96,10 @@ class SQLiteStore:
         self.conn.executescript(self.SCHEMA)
         # Idempotent: add columns introduced after initial schema
         self._ensure_column("papers", "extract_provider", "TEXT")
+        # VLM-generated figure caption (two-stage pipeline 2026-04-24).
+        # Distinct from ``figures.caption`` which holds paper-provided
+        # captions parsed out of the markdown surrounding the image.
+        self._ensure_column("figures", "vlm_caption", "TEXT")
         self.conn.commit()
         self._lock = threading.Lock()
 
@@ -101,6 +115,20 @@ class SQLiteStore:
             self.conn.close()
 
     def already_done(self, paper_id: str) -> bool:
+        # Truth source priority: Qdrant zotero_library (cross-host) → SQLite
+        # (per-host cost cache). Qdrant has the chunks, so any host that
+        # touches the same collection sees the same "done" set. SQLite stays
+        # as the LLM-extraction cache (raw md / extracted_json) so a host
+        # still pays nothing extra to re-warm if we ever re-ingest.
+        if self._qdrant_writer is not None:
+            try:
+                if self._qdrant_writer.has_paper(paper_id):
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "Qdrant has_paper(%s) failed, falling back to SQLite: %s",
+                    paper_id, e,
+                )
         with self._lock:
             c = self.conn.execute("SELECT 1 FROM papers WHERE paper_id=?", (paper_id,))
             return c.fetchone() is not None
@@ -170,8 +198,8 @@ class SQLiteStore:
                         """INSERT INTO figures
                            (paper_id, figure_idx, mineru_name, content_sha,
                             caption, bytes_len, width, height, mime,
-                            webdav_path, downscaled, created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            webdav_path, downscaled, created_at, vlm_caption)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             paper.paper_id, i,
                             f["mineru_name"], f["content_sha"],
@@ -181,6 +209,7 @@ class SQLiteStore:
                             f.get("webdav_path"),
                             1 if f.get("downscaled") else 0,
                             now,
+                            f.get("vlm_caption"),
                         ),
                     )
                 self.conn.execute(
@@ -318,6 +347,26 @@ class QdrantWriter:
             from fastembed import SparseTextEmbedding
             self._bm25 = SparseTextEmbedding(model_name="Qdrant/bm25")
         return self._bm25
+
+    def has_paper(self, paper_id: str) -> bool:
+        """Cross-host provenance: True iff this paper_id has any chunk in
+        the zotero_library collection. Used by SQLiteStore.already_done as
+        the primary truth source so a fresh host doesn't re-pay LLM cost
+        just because its local SQLite is empty."""
+        from qdrant_client import models
+        pts, _ = self.qc.scroll(
+            collection_name=self.collection,
+            scroll_filter=models.Filter(must=[
+                models.FieldCondition(
+                    key="paper_id",
+                    match=models.MatchValue(value=paper_id),
+                ),
+            ]),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return len(pts) > 0
 
     def _embed_dense(self, texts: list[str]) -> list[list[float]]:
         """DashScope text-embedding-v4; batches up to 10."""
@@ -876,7 +925,7 @@ def make_writers(
     dashscope_key = dashscope_api_key or os.environ.get("DASHSCOPE_API_KEY", "")
     if not dashscope_key:
         raise RuntimeError("DASHSCOPE_API_KEY required for embeddings")
-    sql = SQLiteStore(sqlite_path)
     q = QdrantWriter(qdrant_host, qdrant_port, qdrant_collection, dashscope_key)
+    sql = SQLiteStore(sqlite_path, qdrant_writer=q)
     n = Neo4jWriter(neo4j_uri, neo4j_user, neo4j_password)
     return sql, q, n
