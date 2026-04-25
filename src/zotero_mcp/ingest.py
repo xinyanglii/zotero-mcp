@@ -705,49 +705,67 @@ def _qdrant_has_chunks(qd, paper_id: str) -> bool:
     return bool(data.get("result", {}).get("points"))
 
 
-def _stage_a_upload_figures(sql, figures: list[dict], paper_id: str) -> int:
-    """Stage A: upload every figure to the independent WebDAV tree.
+def _stage_vlm_caption(figures: list[dict], paper_id: str) -> tuple[int, int]:
+    """Two-stage pipeline stage 1: caption each figure via NIM VLM
+    (llama-4-maverick by default). Mutates figures in-place setting
+    ``vlm_caption`` (or None on fail). Returns (n_ok, n_fail).
 
-    Mutates each figure dict in place, setting ``webdav_path`` on success.
-    Per-figure failures are logged + recorded in ``failures`` but don't stop
-    the other figures. A streak of ``WEBDAV_FIG_CB_LIMIT`` consecutive
-    outage-class errors trips a circuit breaker: the remaining figures get
-    ``webdav_path=None`` and can be retried later by
-    ``backfill_pending_figures``. Returns count of successfully uploaded.
+    Skipped entirely when ZKG_DISABLE_CAPTION=1. Rate-limit handled
+    internally by the captioner (token bucket across threads)."""
+    if os.environ.get("ZKG_DISABLE_CAPTION") == "1" or not figures:
+        return (0, 0)
+    # Late import so disabling this stage doesn't require unified_llm
+    # (e.g., tests that mock the whole stage).
+    from unified_llm.providers import NvidiaVisionCaptioner
+    cap = NvidiaVisionCaptioner()
+
+    def _one(f: dict) -> bool:
+        img_bytes = f.get("bytes_for_upload")
+        if not img_bytes:
+            f["vlm_caption"] = None
+            return False
+        result = cap.caption(img_bytes, mime=f.get("mime", "image/jpeg"))
+        f["vlm_caption"] = result
+        return bool(result)
+
+    max_workers = min(len(figures),
+                      int(os.environ.get("ZKG_VLM_PARALLEL", "8")))
+    ok = 0
+    fail = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for success in ex.map(_one, figures):
+            if success:
+                ok += 1
+            else:
+                fail += 1
+    logger.info("VLM captioned %d/%d figures for paper_id=%s (parallel=%d)",
+                ok, len(figures), paper_id, max_workers)
+    return (ok, fail)
+
+
+def _stage_a_upload_figures(sql, figures: list[dict], paper_id: str) -> int:
+    """Stage A: batch-upload all figures as a single <paper_id>.zip.
+
+    Replaces the prior per-figure PUT loop (30-50 requests × 5-7s each) with
+    one zip PUT. All-or-nothing: on failure every figure stays webdav_path=
+    None and backfill_pending_figures retries next run. Mutates each figure
+    dict in place setting ``webdav_path``. Returns count uploaded.
     """
     from zotero_mcp import webdav as _wd
-    uploaded = 0
-    consec_out = 0
-    tripped = False
+    if not figures:
+        return 0
+    try:
+        path_map = _wd.put_figures_zip(paper_id, figures)
+    except _wd.WebDAVOutageError as e:
+        sql.record_failure(paper_id, "webdav_figures_zip", repr(e)[:400])
+        return 0
+    except Exception as e:
+        sql.record_failure(paper_id, "webdav_figures_zip", repr(e)[:400])
+        logger.warning("webdav put_figures_zip %s failed: %s", paper_id, e)
+        return 0
     for f in figures:
-        if tripped:
-            # leave webdav_path=None; backfill will retry
-            continue
-        try:
-            rel = _wd.put_figure(paper_id, f["mineru_name"], f["bytes_for_upload"])
-            f["webdav_path"] = rel
-            uploaded += 1
-            consec_out = 0
-        except _wd.WebDAVOutageError as e:
-            sql.record_failure(paper_id, "webdav_figures",
-                               f"{f['mineru_name']}: {e!r}"[:400])
-            consec_out += 1
-            if consec_out >= WEBDAV_FIG_CB_LIMIT:
-                logger.error(
-                    "WebDAV figures CB trip on %s after %d consecutive outages — "
-                    "remaining %d figures deferred to backfill",
-                    paper_id, consec_out,
-                    sum(1 for g in figures if g.get("webdav_path") is None) - 1,
-                )
-                tripped = True
-        except Exception as e:
-            # non-outage (413, config, etc): log per-figure, keep going
-            sql.record_failure(paper_id, "webdav_figures",
-                               f"{f['mineru_name']}: {e!r}"[:400])
-            logger.warning("webdav put_figure %s/%s failed: %s",
-                           paper_id, f["mineru_name"], e)
-            consec_out = 0
-    return uploaded
+        f["webdav_path"] = path_map.get(f["mineru_name"])
+    return sum(1 for f in figures if f.get("webdav_path"))
 
 
 def _backfill_pending_figures(
@@ -930,11 +948,23 @@ def ingest_one(item: dict, *, sql, qd, ne, work_tmp: Path) -> dict[str, str | fl
     figures = _build_figures(md, images_raw) if images_raw else []
     stats["figures"] = len(figures)
 
+    # Step 3.5 — VLM captioning (two-stage pipeline, 2026-04-24). Runs
+    # NIM llama-4-maverick on each figure to produce a 2-4 sentence
+    # description; these descriptions feed the text-chain extractor
+    # instead of shipping raw images to Kimi/glm-4.6v. Saves Kimi
+    # subscription quota and routes JSON extraction through stronger
+    # text models. Disabled via ZKG_DISABLE_CAPTION=1.
+    caption_ok, caption_fail = _stage_vlm_caption(figures, pid)
+    stats["vlm_captioned"] = caption_ok
+
     # Step 4 — LLM extract. Pass figures so VLM chain fires; extract_structured
     # returns (paper, provider_name). None → extract failed after retries.
+    # Prefer text chain + captions when all figures captioned successfully.
     vlm_input = [
         {"bytes": f["bytes_for_upload"], "caption": f.get("caption"),
-         "mime": f.get("mime", "image/jpeg")}
+         "mime": f.get("mime", "image/jpeg"),
+         "vlm_caption": f.get("vlm_caption"),
+         "mineru_name": f.get("mineru_name")}
         for f in figures
     ]
     t_llm = time.time()

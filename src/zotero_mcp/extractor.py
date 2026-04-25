@@ -26,10 +26,12 @@ Design (see plan §3.1):
 """
 from __future__ import annotations
 
+import base64 as _b64
 import json
 import logging
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -37,6 +39,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+# unified_llm router (canonical at ~/.claude/scripts/unified_llm/, synced
+# via claude-config). Replaces the legacy PROVIDER_CHAIN / VLM_PROVIDER_CHAIN
+# urllib shims. Weighted-random Kimi+GLM tier1 + qwen-plus-latest tier2 +
+# 5-min cooldown on 429/5xx. Vision dispatch is auto-detected from messages.
+_UL = os.path.expanduser("~/.claude/scripts")
+if _UL not in sys.path:
+    sys.path.insert(0, _UL)
+from unified_llm import call as _unified_call  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +635,24 @@ def extract_structured(
     user_msg = f"paper_id={paper_id}\ntitle={title}\n\n=== Markdown ===\n{truncated}"
     if item_type_hint and item_type_hint in _NON_PAPER_ITEM_TYPES:
         user_msg += NON_PAPER_HINT
+
+    # Two-stage pipeline 2026-04-24: if upstream captioned all figures via
+    # NIM VLM, merge captions into the text prompt and skip the vision
+    # chain. Only triggered when every figure has a non-empty vlm_caption
+    # and ZKG_DISABLE_CAPTION is not set. Otherwise fall back to the
+    # legacy path: ship raw images to Kimi/glm-4.6v.
+    used_captions = False
+    if (figures
+            and all(f.get("vlm_caption") for f in figures)
+            and os.environ.get("ZKG_DISABLE_CAPTION") != "1"):
+        cap_lines = ["", "=== Figure descriptions (auto-captioned) ===", ""]
+        for i, f in enumerate(figures, 1):
+            name = f.get("mineru_name") or f"fig{i}"
+            cap_lines.append(f"[figure {i} / {name}]: {f['vlm_caption']}")
+        user_msg += "\n" + "\n".join(cap_lines)
+        figures = None
+        used_captions = True
+
     wants_vlm = bool(figures)
     last_err, last_raw = "unknown", ""
 
@@ -634,7 +663,13 @@ def extract_structured(
             data = _extract_json_object(raw)
             data["paper_id"] = paper_id
             paper = ExtractedPaper.model_validate(data)
-            logger.info("extracted paper_id=%s via %s", paper_id, provider_name)
+            if used_captions:
+                mode = "text+caption"
+            elif wants_vlm:
+                mode = "vision"
+            else:
+                mode = "text"
+            logger.info("extracted paper_id=%s via %s/%s", paper_id, provider_name, mode)
             return paper, provider_name
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")[:400]
@@ -656,9 +691,52 @@ def extract_structured(
 def _run_extract_call(
     user_msg: str, figures: list[dict] | None,
 ) -> tuple[str, str]:
-    """One attempt of extract. If ``figures`` provided, try VLM chain first;
-    on VLM-all-fail (every provider exhausted), fall back to text chain.
-    Returns ``(raw_response_text, provider_name)``."""
+    """One attempt of extract via unified_llm router. Auto-routes to
+    vision tier1 (kimi 80% + glm-4.6v 20%) when ``figures`` present,
+    else text tier1 (kimi 50% + glm-5.1 50%); tier2 qwen-plus-latest
+    fallback on 429/5xx with 5-min cooldown.
+
+    Replaces the legacy two-step chain (VLM_PROVIDER_CHAIN sequential
+    → on all-fail degrade to PROVIDER_CHAIN text). Unified_llm's
+    weighted-random + cooldown makes the degradation automatic.
+
+    Returns ``(raw_response_text, provider_name)``.
+    """
+    prompt_text = SYSTEM_PROMPT + "\n\n" + user_msg
+    if figures:
+        # OpenAI-style content blocks — unified_llm's translate_for_anthropic
+        # converts image_url + data URI → Anthropic image blocks for Kimi.
+        content: list[dict] = [{"type": "text", "text": prompt_text}]
+        for f in figures[:VLM_MAX_FIGURES]:
+            b64 = _b64.b64encode(f["bytes"]).decode()
+            mime = f.get("mime", "image/jpeg")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        content.append({"type": "text", "text": VISION_TAIL_PROMPT})
+        messages = [{"role": "user", "content": content}]
+    else:
+        messages = [{"role": "user", "content": prompt_text}]
+
+    # response_format=json_object only for text (vision providers sometimes
+    # reject it with 400). Unified_llm passes it through to OpenAI-compat;
+    # Kimi's Anthropic shim adds a JSON-only system-prompt hint.
+    resp = _unified_call(
+        messages,
+        task="zkg_extract",
+        max_tokens=16000,
+        temperature=0.2,
+        response_format=None if figures else {"type": "json_object"},
+    )
+    return resp["text"], resp.get("provider", "unknown")
+
+
+def _run_extract_call_legacy(
+    user_msg: str, figures: list[dict] | None,
+) -> tuple[str, str]:
+    """[DEPRECATED] Legacy chain-based dispatch. Kept for reference only —
+    unified_llm replaces this (see _run_extract_call above)."""
     if figures:
         try:
             return _call_llm_chain(
@@ -666,10 +744,6 @@ def _run_extract_call(
                 chain_label="vlm-extractor",
             )
         except Exception as e:
-            # Any VLM-chain exhaustion (HTTP 4xx/5xx, RuntimeError for missing
-            # keys, transport errors) → degrade to text chain so the paper
-            # still ingests with a less rich but valid JSON. Log the concrete
-            # error for diagnosis. Spec §4 "VLM 全挂 → 降级纯文本".
             if isinstance(e, urllib.error.HTTPError):
                 body = ""
                 try:
