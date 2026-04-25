@@ -1149,6 +1149,46 @@ def main():
     logger.info("DONE in %.1fm. status breakdown: %s", (time.time()-t0)/60,
                 stats_per_status)
 
+    # T5 L5 — auto-canonicalize on ingest end. Idempotent (T2 sqlite cache
+    # + edge_log skip already-processed entities). Failure-tolerant: errors
+    # only log, do not affect ingest exit code. flock(1) prevents collision
+    # with manually-launched canonicalize_entities.py runs.
+    if (os.environ.get("ZKG_AUTO_CANONICALIZE", "1") == "1"
+            and stats_per_status.get("ok", 0) > 0):
+        _run_auto_canonicalize()
+
+
+def _run_auto_canonicalize():
+    """Trigger incremental T2 entity canonicalization. Best-effort:
+    skip silently if another canonicalize is already running (flock -n)."""
+    import subprocess
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    script = repo_root / "scripts" / "canonicalize_entities.py"
+    if not script.exists():
+        logger.warning("auto-canonicalize: script not found at %s, skipping", script)
+        return
+    lockfile = "/tmp/zkg-canonicalize.lock"
+    logger.info("auto-canonicalize: launching incremental T2 (flock %s)", lockfile)
+    try:
+        result = subprocess.run(
+            ["flock", "-n", lockfile,
+             sys.executable, str(script),
+             "--labels", "Concept", "Method", "Dataset"],
+            timeout=3600,
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0:
+            logger.info("auto-canonicalize: completed (rc=0)")
+        elif result.returncode == 1 and not result.stdout and not result.stderr:
+            logger.info("auto-canonicalize: another instance holds the lock, skipping")
+        else:
+            logger.warning("auto-canonicalize: rc=%d stderr_tail=%s",
+                           result.returncode, result.stderr[-500:] if result.stderr else "")
+    except subprocess.TimeoutExpired:
+        logger.warning("auto-canonicalize: timed out after 1h, skipped")
+    except Exception as e:
+        logger.warning("auto-canonicalize: exception, skipped: %s", e)
+
 
 if __name__ == "__main__":
     main()
