@@ -407,6 +407,16 @@ def add_by_doi(
         if not normalized:
             return f"Error: '{doi}' does not appear to be a valid DOI."
 
+        # Dedup: search-before-create
+        existing = _helpers._find_existing_by_doi(write_zot, normalized)
+        if existing:
+            ctx.info(f"DOI {normalized} already in library as {existing}; merging tags/collections")
+            merged = _helpers._merge_collections_tags(write_zot, existing, collections, tags, ctx)
+            merge_note = f" ({', '.join(merged)})" if merged else " (no new tags/collections)"
+            return (f"Already in library: DOI:{normalized}\n"
+                    f"Item key: `{existing}`\n"
+                    f"Merged{merge_note}")
+
         ctx.info(f"Fetching metadata for DOI: {normalized}")
 
         resp = requests.get(
@@ -496,9 +506,11 @@ def add_by_doi(
                 item_data[field] = value
 
         # Tags
-        tag_list = _helpers._normalize_str_list_input(tags, "tags")
-        if tag_list:
-            item_data["tags"] = [{"tag": t} for t in tag_list]
+        # Always include the doi:<doi> dedup tag for future O(1) duplicate detection
+        tag_list = _helpers._normalize_str_list_input(tags, "tags") or []
+        if _helpers._doi_dedup_tag(normalized) not in tag_list:
+            tag_list = list(tag_list) + [_helpers._doi_dedup_tag(normalized)]
+        item_data["tags"] = [{"tag": t} for t in tag_list]
 
         # Collections
         coll_keys = _helpers._normalize_str_list_input(collections, "collections")
@@ -600,7 +612,20 @@ def add_by_url(
 
 
 def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx):
-    """Add an arXiv paper by ID. Internal helper for add_by_url."""
+    """Add an arXiv paper by ID. Internal helper for add_by_url.
+
+    Skips creation if an item with this arXiv ID already exists; merges
+    new collections/tags into the existing item instead.
+    """
+    # Dedup: search-before-create
+    existing = _helpers._find_existing_by_arxiv(write_zot, arxiv_id)
+    if existing:
+        ctx.info(f"arXiv {arxiv_id} already in library as {existing}; merging tags/collections")
+        merged = _helpers._merge_collections_tags(write_zot, existing, collections, tags, ctx)
+        merge_note = f" ({', '.join(merged)})" if merged else " (no new tags/collections)"
+        return (f"Already in library: arXiv:{arxiv_id}\n"
+                f"Item key: `{existing}`\n"
+                f"Merged{merge_note}")
     ctx.info(f"Fetching arXiv metadata for: {arxiv_id}")
 
     resp = None
@@ -667,9 +692,11 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx):
     if "extra" in template:
         template["extra"] = f"arXiv:{arxiv_id}"
 
-    tag_list = _helpers._normalize_str_list_input(tags, "tags")
-    if tag_list:
-        template["tags"] = [{"tag": t} for t in tag_list]
+    # Always include the arxiv:<id> dedup tag for future O(1) duplicate detection
+    tag_list = _helpers._normalize_str_list_input(tags, "tags") or []
+    if _helpers._arxiv_dedup_tag(arxiv_id) not in tag_list:
+        tag_list = list(tag_list) + [_helpers._arxiv_dedup_tag(arxiv_id)]
+    template["tags"] = [{"tag": t} for t in tag_list]
     coll_keys = _helpers._normalize_str_list_input(collections, "collections")
     if coll_keys:
         template["collections"] = coll_keys

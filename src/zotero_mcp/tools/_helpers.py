@@ -211,6 +211,125 @@ def _normalize_arxiv_id(raw):
 
 
 # ---------------------------------------------------------------------------
+# Duplicate detection (search-before-create for add_by_arxiv / add_by_doi)
+#
+# Strategy: tag-based exact match. Every paper added via _add_by_arxiv /
+# add_by_doi gets a stable identity tag ("arxiv:<id>" / "doi:<doi>"), so
+# future ingests can dedup with an O(1) tag-exact API call. Avoids the
+# pyzotero state-pollution bug and Zotero's q=... NOT searching `extra` /
+# `url` fields. Library backfill adds the tags to existing items.
+# ---------------------------------------------------------------------------
+
+ARXIV_DEDUP_TAG_PREFIX = "arxiv:"
+DOI_DEDUP_TAG_PREFIX = "doi:"
+
+
+def _find_existing_by_tag(zot, tag):
+    """Raw-urllib tag-exact search; returns first matching item key or None.
+
+    Bypasses pyzotero to avoid state-leak of query params into subsequent
+    calls (item_template etc.).
+    """
+    if not tag:
+        return None
+    import urllib.request as _ur
+    import urllib.parse as _up
+    import json as _json
+    url = (f"https://api.zotero.org/users/{zot.library_id}/items"
+           f"?tag={_up.quote(tag)}&format=json&limit=5")
+    headers = {"Zotero-API-Key": zot.api_key, "Zotero-API-Version": "3"}
+    try:
+        req = _ur.Request(url, headers=headers)
+        with _ur.urlopen(req, timeout=15) as r:
+            items = _json.loads(r.read())
+        if items:
+            return items[0]["key"]
+    except Exception:
+        pass
+    return None
+
+
+def _find_existing_by_arxiv(zot, arxiv_id):
+    """Find existing item by arxiv:<id> tag. Returns key or None."""
+    if not arxiv_id:
+        return None
+    return _find_existing_by_tag(zot, f"{ARXIV_DEDUP_TAG_PREFIX}{arxiv_id}")
+
+
+def _find_existing_by_doi(zot, doi):
+    """Find existing item by doi:<doi> tag. Returns key or None."""
+    if not doi:
+        return None
+    return _find_existing_by_tag(zot, f"{DOI_DEDUP_TAG_PREFIX}{doi.lower()}")
+
+
+def _arxiv_dedup_tag(arxiv_id):
+    """Return the canonical dedup tag for an arxiv ID."""
+    return f"{ARXIV_DEDUP_TAG_PREFIX}{arxiv_id}"
+
+
+def _doi_dedup_tag(doi):
+    """Return the canonical dedup tag for a DOI."""
+    return f"{DOI_DEDUP_TAG_PREFIX}{doi.lower()}"
+
+
+def _merge_collections_tags(write_zot, existing_key, new_collections, new_tags, ctx=None):
+    """Merge new collections/tags into existing Zotero item via PATCH.
+
+    Skips no-op merges. Returns list of human-readable change summaries
+    (e.g. ["+2 collection(s)", "+3 tag(s)"]).
+    """
+    import urllib.request
+    import json as _json
+    changes = []
+    api_key = write_zot.api_key
+    lib_id = write_zot.library_id
+    base = f"https://api.zotero.org/users/{lib_id}/items/{existing_key}"
+    hdrs = {'Zotero-API-Key': api_key, 'Zotero-API-Version': '3'}
+    try:
+        req = urllib.request.Request(base, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            item = _json.loads(r.read())
+        data = item['data']
+        version = item['version']
+        patch = {}
+
+        new_coll = _normalize_str_list_input(new_collections, "collections")
+        if new_coll:
+            cur = list(data.get('collections', []))
+            merged = sorted(set(cur + new_coll))
+            if set(merged) != set(cur):
+                patch['collections'] = merged
+                added = sorted(set(new_coll) - set(cur))
+                if added:
+                    changes.append(f"+{len(added)} collection(s)")
+
+        new_tags_list = _normalize_str_list_input(new_tags, "tags")
+        if new_tags_list:
+            cur_tags = [t.get('tag', '') for t in data.get('tags', [])]
+            merged_tags = sorted(set(cur_tags + new_tags_list))
+            if set(merged_tags) != set(cur_tags):
+                patch['tags'] = [{'tag': t} for t in merged_tags if t]
+                added = sorted(set(new_tags_list) - set(cur_tags))
+                if added:
+                    changes.append(f"+{len(added)} tag(s)")
+
+        if patch:
+            body = _json.dumps(patch).encode()
+            req = urllib.request.Request(
+                base, method='PATCH', data=body,
+                headers={**hdrs,
+                         'Content-Type': 'application/json',
+                         'If-Unmodified-Since-Version': str(version)},
+            )
+            urllib.request.urlopen(req, timeout=15).read()
+    except Exception as e:
+        if ctx is not None:
+            ctx.info(f"Could not merge into existing {existing_key}: {e}")
+    return changes
+
+
+# ---------------------------------------------------------------------------
 # PDF / open-access helpers
 # ---------------------------------------------------------------------------
 
