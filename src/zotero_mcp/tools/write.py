@@ -679,22 +679,14 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx):
         item_key = next(iter(result["success"].values()))
 
         # arXiv always has a free PDF — try to attach it
+        # Use _download_and_attach_pdf helper which prefers WebDAV over Zotero Cloud
+        # (PDFs live on Jianguoyun WebDAV per repo hard rule, not Zotero's 300MB free tier)
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-        pdf_status = "no PDF attached"
         try:
-            pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
-            pdf_resp.raise_for_status()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
-                filepath = os.path.join(tmpdir, filename)
-                with open(filepath, "wb") as f:
-                    for chunk in pdf_resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                write_zot.attachment_both(
-                    [(filename, filepath)],
-                    parentid=item_key,
-                )
-            pdf_status = "PDF attached"
+            ok = _helpers._download_and_attach_pdf(
+                write_zot, item_key, pdf_url, arxiv_id, ctx
+            )
+            pdf_status = "PDF attached" if ok else "no PDF attached"
         except Exception as e:
             ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
             pdf_status = f"no PDF attached ({e})"

@@ -100,7 +100,7 @@ def get_item_fulltext(
         # re-running MinerU on every fulltext request — several orders of
         # magnitude faster than downloading the PDF and re-parsing.
         try:
-            from zotero_mcp import webdav as _webdav
+            from zotero_kg import webdav as _webdav
             if _webdav.webdav_enabled():
                 children = zot.children(item_key)
                 md_atts = [
@@ -208,7 +208,7 @@ def get_item_fulltext(
                 # users whose storage is configured to WebDAV).
                 downloaded = False
                 try:
-                    from zotero_mcp import webdav as _webdav
+                    from zotero_kg import webdav as _webdav
                     if _webdav.webdav_enabled():
                         raw = _webdav.fetch_attachment_bytes(attachment.key)
                         if raw:

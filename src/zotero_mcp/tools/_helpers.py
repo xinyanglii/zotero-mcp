@@ -238,7 +238,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
             return False
 
         # Preferred path: Jianguoyun-style WebDAV (matches user's real storage)
-        from zotero_mcp import webdav as _webdav
+        from zotero_kg import webdav as _webdav
         if _webdav.webdav_enabled():
             att_key = _webdav.create_zotero_webdav_attachment(
                 write_zot,
